@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' https: http:; font-src 'self' https: http: data:; img-src 'self' https: http: data: mailpart: blob:; media-src 'self' https: http: mailpart:; connect-src 'self'">
+  <title>Unified Inbox</title>
+  <link rel="stylesheet" href="../node_modules/@fontsource/roboto/400.css">
+  <link rel="stylesheet" href="../node_modules/@fontsource/roboto/500.css">
+  <link rel="stylesheet" href="../node_modules/@fontsource/roboto/700.css">
+  <link rel="stylesheet" href="../node_modules/material-symbols/outlined.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-left">
+      <button class="icon-btn" id="menu-btn" title="Collapse menu"><span class="ms">menu</span></button>
+      <a class="logo" href="#f=inbox" title="Unified Inbox">
+        <svg viewBox="0 0 40 32" width="40" height="32" aria-hidden="true">
+          <rect x="2" y="3" width="36" height="26" rx="5" fill="#fff" stroke="#c4c7c5" stroke-width="1.5"/>
+          <path d="M3.5 6.5 L20 18 L36.5 6.5" fill="none" stroke="#1a73e8" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="8" y="22" width="7" height="3" rx="1.5" fill="#1a73e8"/>
+          <rect x="16.5" y="22" width="7" height="3" rx="1.5" fill="#188038"/>
+          <rect x="25" y="22" width="7" height="3" rx="1.5" fill="#a142f4"/>
+        </svg>
+        <span>Unified Inbox</span>
+      </a>
+    </div>
+    <form class="search" id="search-form" autocomplete="off">
+      <button class="icon-btn" type="submit" title="Search"><span class="ms">search</span></button>
+      <input id="search-input" type="text" placeholder="Search mail" spellcheck="false">
+      <button class="icon-btn" type="button" id="search-clear" title="Clear search"><span class="ms">close</span></button>
+      <button class="search-account" type="button" id="search-account" data-menu hidden></button>
+    </form>
+    <div class="topbar-right">
+      <button class="icon-btn" id="refresh-top" title="Check for new mail"><span class="ms">sync</span></button>
+      <button class="icon-btn" id="help-btn" title="Keyboard shortcuts"><span class="ms">help</span></button>
+      <button class="icon-btn" id="settings-btn" title="Settings"><span class="ms">settings</span></button>
+      <button class="avatar-btn" id="avatar-btn" title="Your accounts"></button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="sidebar" id="sidebar">
+      <div class="sidebar-panel" id="sidebar-panel">
+        <button class="compose-btn" id="compose-btn" title="Compose"><span class="ms">edit</span><span class="label">Compose</span></button>
+        <div id="nav-folders"></div>
+        <div class="nav-section-head">
+          <span class="label">Accounts</span>
+          <button class="icon-btn" id="add-account-btn" title="Add account"><span class="ms">add</span></button>
+        </div>
+        <div id="nav-accounts"></div>
+      </div>
+    </nav>
+    <main class="main mode-none" id="main">
+      <div class="pane" id="pane-list"></div>
+      <div class="pane-resizer" id="pane-resizer" title="Drag to resize · double-click to reset"></div>
+      <div class="pane hidden" id="pane-read"></div>
+    </main>
+    <aside class="qs" id="qs"><div class="qs-inner" id="qs-inner"></div></aside>
+  </div>
+
+  <div id="compose-root"></div>
+  <div id="popover-root"></div>
+  <div id="modal-root"></div>
+  <div class="snackbar" id="snackbar" role="status"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

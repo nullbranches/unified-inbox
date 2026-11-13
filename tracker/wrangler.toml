@@ -1,0 +1,8 @@
+name = "unified-inbox-tracker"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+[[kv_namespaces]]
+binding = "OPENS"
+# Paste the id printed by: npx wrangler kv namespace create OPENS
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
