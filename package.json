@@ -1,11 +1,13 @@
 {
   "name": "unified-inbox",
   "productName": "Unified Inbox",
-  "version": "1.0.10",
+  "version": "2.0.0",
   "description": "All your email accounts in one Gmail-style inbox",
-  "main": "main.js",
+  "main": "out/main.js",
   "scripts": {
-    "start": "electron .",
+    "build": "node scripts/compile.js",
+    "typecheck": "node scripts/compile.js --check",
+    "start": "node scripts/compile.js && electron .",
     "dist": "electron-builder --win",
     "show-version": "node scripts/bump-version.js --show",
     "bump:patch": "node scripts/bump-version.js patch",
@@ -25,18 +27,21 @@
     "nodemailer": "^10.1.7"
   },
   "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/nodemailer": "^8.0.2",
     "electron": "^44.9.2",
-    "electron-builder": "^26.15.3"
+    "electron-builder": "^26.15.3",
+    "typescript": "^7.0.2"
   },
   "build": {
     "appId": "dev.unifiedinbox.app",
     "productName": "Unified Inbox",
     "electronDist": "node_modules/electron/dist",
     "files": [
-      "main.js",
-      "preload.js",
-      "lib/**/*",
+      "out/**/*.js",
       "renderer/**/*",
+      "!renderer/**/*.ts",
+      "!renderer/tsconfig.json",
       "build/icon.png"
     ],
     "win": {
@@ -46,6 +51,7 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
-    }
+    },
+    "beforeBuild": "scripts/compile.js"
   }
 }

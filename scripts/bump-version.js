@@ -10,7 +10,9 @@ const root = path.join(__dirname, "..");
 const pkgPath = path.join(root, "package.json");
 const lockPath = path.join(root, "package-lock.json");
 
+/** @param {string} p */
 const readJson = (p) => JSON.parse(fs.readFileSync(p, "utf8"));
+/** @param {string} p @param {unknown} data */
 const writeJson = (p, data) =>
   fs.writeFileSync(p, JSON.stringify(data, null, 2) + "\n", "utf8");
 

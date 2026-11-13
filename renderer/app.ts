@@ -1,8 +1,10 @@
 'use strict';
 
-// `api` is the bridge exposed by preload.js (window.api).
-const $ =(sel, root = document) => root.querySelector(sel);
-const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
+// `api` is the bridge exposed by preload.ts (window.api).
+// $ is for elements that are known to be there (the page's fixed parts, or
+// ones just rendered); check the result when they may not be.
+const $ = <E extends HTMLElement = HTMLElement>(sel: string, root: ParentNode = document) => root.querySelector<E>(sel) as E;
+const $$ = <E extends HTMLElement = HTMLElement>(sel: string, root: ParentNode = document) => [...root.querySelectorAll<E>(sel)];
 
 const FOLDERS = [
   { key: 'inbox', label: 'Inbox', icon: 'inbox' },
@@ -14,7 +16,7 @@ const FOLDERS = [
   { key: 'all', label: 'All Mail', icon: 'mail', more: true },
 ];
 
-const EMPTY = {
+const EMPTY: Record<string, [string, string, string]> = {
   inbox: ['inbox', 'Your inbox is empty', 'New mail from all of your accounts shows up here.'],
   starred: ['star', 'No starred messages', 'Stars let you give messages a special status to make them easier to find.'],
   sent: ['send', 'No sent messages', 'Messages you send from any account will appear here.'],
@@ -25,7 +27,7 @@ const EMPTY = {
 };
 
 // An inbox-type section with nothing in it (on this page).
-const SECTION_EMPTY = {
+const SECTION_EMPTY: Record<string, string> = {
   unread: "Woohoo! You've read all the messages in your inbox.",
   starred: 'No starred messages.',
   important: 'No important messages.',
@@ -37,7 +39,148 @@ const AVATAR_COLORS = ['#e8710a', '#188038', '#d93025', '#1a73e8', '#9334e6', '#
 // for changes elsewhere, like other folders or mail read on another device.
 const POLL_MS = 2 * 60 * 1000;
 
-const state = {
+// ---------- types ----------
+
+// The URL hash (see readRoute).
+interface Route {
+  folder: string;
+  account: string;
+  page: number;
+  spage: number;
+  q: string;
+  // The open conversation's key.
+  open: string | null;
+}
+
+// A message of the open conversation; `pending` ones were just sent and aren't on the server's list yet.
+type Member = Inbox.MessageSummary & { pending?: boolean };
+
+// What prepareBody makes of a message for its iframe.
+interface PreparedBody {
+  html: string;
+  trimmed: boolean;
+}
+
+// One message's full content in the open conversation: loading (promise), loaded (data) or failed (error).
+interface FullEntry {
+  data?: Inbox.FullMessage;
+  promise?: Promise<void>;
+  error?: string;
+  body?: PreparedBody;
+  showQuotes?: boolean;
+}
+
+// The conversation in the reading pane.
+interface OpenThread {
+  key: string;
+  folder: string;
+  accountId: string;
+  members: Member[];
+  expanded: Set<string>;
+  full: Map<string, FullEntry>;
+  showAll: boolean;
+  version: number;
+  error: string | null;
+  // Messages deleted from it here (a refresh must not bring them back).
+  gone?: Set<string>;
+}
+
+// A conversation to act on: a list row, or the open conversation.
+interface ActionTarget {
+  key: string;
+  folder: string;
+  messages: Member[];
+}
+
+type RcptField = 'to' | 'cc' | 'bcc';
+
+// The message being written.
+interface Compose {
+  from: string | undefined;
+  chips: Record<RcptField, Inbox.Address[]>;
+  subject: string;
+  body: string;
+  quote: Inbox.Quote | null;
+  inReplyTo: string | null;
+  references: string[] | null;
+  forward: Inbox.MessageRef | null;
+  forwardFiles: Inbox.AttachmentInfo[];
+  files: Inbox.OutgoingAttachment[];
+  track: boolean;
+}
+
+interface ComposeOptions {
+  from?: string;
+  to?: Inbox.Address[] | string;
+  cc?: Inbox.Address[] | string;
+  bcc?: Inbox.Address[] | string;
+  subject?: string;
+  body?: string;
+  quote?: Inbox.Quote | null;
+  inReplyTo?: string | null;
+  references?: string[] | null;
+  forward?: Inbox.MessageRef | null;
+  forwardFiles?: Inbox.AttachmentInfo[];
+}
+
+// Menu rows: an action ({ label, run, icon?, checked?, disabled? }), a group
+// heading ({ heading }), or '-' for a divider.
+interface MenuEntry {
+  label?: string;
+  run?: () => unknown;
+  icon?: string;
+  checked?: boolean;
+  disabled?: boolean;
+  heading?: string;
+}
+type MenuItem = MenuEntry | '-';
+
+// A real account as the account form edits it (state.accounts carry their servers).
+type EditableAccount = Inbox.PublicAccount & { imap: Inbox.ServerConfig; smtp: Inbox.ServerConfig; user: string };
+
+// The button on the snackbar.
+interface SnackAction {
+  label: string;
+  run: () => void;
+}
+
+// "Select all N conversations": every conversation of the view.
+interface Bulk {
+  threads: Inbox.Thread[];
+  byKey: Map<string, Inbox.Thread>;
+  complete: boolean;
+}
+
+interface State {
+  accounts: Inbox.PublicAccount[];
+  providers: Record<string, Inbox.Provider>;
+  demo: boolean;
+  route: Route;
+  list: Inbox.ViewResult | null;
+  loading: boolean;
+  listReq: number;
+  selected: Set<string>;
+  lastSelectIdx: number;
+  bulk: Bulk | null;
+  bulkLoading: boolean;
+  focusKey: string | null;
+  counts: Inbox.Counts;
+  thread: OpenThread | null;
+  settings: Inbox.Settings;
+  qsOpen: boolean;
+  collapsedSections: Set<string>;
+  listCache: Map<string | undefined, Inbox.ViewResult>;
+  listScroll?: { sig: string | undefined; top: number };
+  badge: number;
+  compose: Compose | null;
+  moreOpen: boolean;
+  tracking: Inbox.TrackingConfig;
+  lastChecked: number;
+  searchAccount: string | null;
+  accountBeforeSearch: string;
+}
+
+const state: State = {
   accounts: [],
   providers: {},
   demo: false,
@@ -53,7 +196,7 @@ const state = {
   focusKey: null, // keyboard cursor (j/k), tracked by conversation so it survives refreshes
   counts: {},
   thread: null, // the open conversation
-  settings: {},
+  settings: {} as Inbox.Settings, // (filled in by init)
   qsOpen: false,
   collapsedSections: new Set(),
   // Last result per view, shown instantly when you come back to it (then refreshed).
@@ -69,8 +212,8 @@ const state = {
 
 // ---------- helpers ----------
 
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+function esc(s: unknown): string {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' } as Record<string, string>)[c]);
 }
 
 // ---------- search highlighting ----------
@@ -79,10 +222,10 @@ function esc(s) {
 // of from:/to:/subject: count, filters like is:unread or has:attachment and
 // excluded (-word) terms don't.
 const NON_TEXT_OPS = new Set(['is', 'has', 'in', 'label', 'before', 'after', 'older', 'newer', 'older_than', 'newer_than', 'larger', 'smaller', 'size', 'category', 'filename', 'list', 'deliveredto', 'rfc822msgid']);
-let hlCache = { q: null, re: null };
-function searchRegex(q) {
+let hlCache: { q: string | null; re: RegExp | null } = { q: null, re: null };
+function searchRegex(q: string): RegExp | null {
   if (hlCache.q === q) return hlCache.re;
-  const terms = [];
+  const terms: string[] = [];
   for (const [, neg, op, phrase, word] of String(q || '').matchAll(/(-?)(?:([a-z_]+):)?(?:"([^"]*)"|([^\s"]+))/gi)) {
     if (neg || (op && NON_TEXT_OPS.has(op.toLowerCase()))) continue;
     const t = (phrase ?? word).replace(/^[({]+|[)}]+$/g, '').trim();
@@ -96,7 +239,7 @@ function searchRegex(q) {
 }
 
 // Escaped text with the current search's words marked.
-function hl(text) {
+function hl(text: unknown): string {
   const re = state.route.q ? searchRegex(state.route.q) : null;
   const s = String(text ?? '');
   if (!re) return esc(s);
@@ -110,16 +253,16 @@ function hl(text) {
 }
 
 // Marks the search's words inside an opened message (its own document).
-function highlightDocument(doc, q) {
+function highlightDocument(doc: Document | null, q: string): void {
   const re = q ? searchRegex(q) : null;
   if (!re || !doc?.body) return;
   const walker = doc.createTreeWalker(doc.body, NodeFilter.SHOW_TEXT, {
-    acceptNode: (n) => (n.parentElement?.closest('script,style,noscript,textarea,mark') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+    acceptNode: (n: Node) => (n.parentElement?.closest('script,style,noscript,textarea,mark') ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
   });
-  const nodes = [];
-  while (walker.nextNode()) if (walker.currentNode.nodeValue.trim()) nodes.push(walker.currentNode);
+  const nodes: Text[] = [];
+  while (walker.nextNode()) if (walker.currentNode.nodeValue!.trim()) nodes.push(walker.currentNode as Text);
   for (const node of nodes) {
-    const text = node.nodeValue;
+    const text = node.nodeValue!;
     re.lastIndex = 0;
     if (!re.test(text)) continue;
     re.lastIndex = 0;
@@ -138,36 +281,36 @@ function highlightDocument(doc, q) {
   }
 }
 
-const keyOf = (m) => `${m.accountId}|${m.folder}|${m.uid}`;
+const keyOf = (m: Inbox.MessageRef) => `${m.accountId}|${m.folder}|${m.uid}`;
 
-function parseKey(key) {
+function parseKey(key: string): Inbox.MessageRef {
   const parts = key.split('|');
   return { accountId: parts[0], folder: parts.slice(1, -1).join('|'), uid: Number(parts[parts.length - 1]) };
 }
 
-const accountById = (id) => state.accounts.find((a) => a.id === id);
-const isMe = (address) => state.accounts.some((a) => a.email.toLowerCase() === String(address || '').toLowerCase());
+const accountById = (id: string | null | undefined) => state.accounts.find((a) => a.id === id);
+const isMe = (address: unknown) => state.accounts.some((a) => a.email.toLowerCase() === String(address || '').toLowerCase());
 
-function displayName(addr) {
+function displayName(addr: Inbox.Address | undefined): string {
   if (!addr) return '';
   if (isMe(addr.address)) return 'me';
   return addr.name || addr.address || '';
 }
 
-const formatAddress = (x) => (x.name ? `${x.name} <${x.address}>` : x.address);
+const formatAddress = (x: Inbox.Address) => (x.name ? `${x.name} <${x.address}>` : x.address);
 
-function colorFor(str) {
+function colorFor(str: unknown): string {
   let h = 0;
-  for (const ch of String(str)) h = (h * 31 + ch.codePointAt(0)) >>> 0;
+  for (const ch of String(str)) h = (h * 31 + ch.codePointAt(0)!) >>> 0;
   return AVATAR_COLORS[h % AVATAR_COLORS.length];
 }
 
-function initial(addr) {
+function initial(addr: { name?: string; address?: string } | undefined): string {
   const s = String(addr?.name || addr?.address || '?');
   return (s.match(/[\p{L}\p{N}]/u)?.[0] || '?').toUpperCase();
 }
 
-function formatListDate(iso) {
+function formatListDate(iso: string): string {
   const d = new Date(iso);
   const now = new Date();
   if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
@@ -175,12 +318,12 @@ function formatListDate(iso) {
   return d.toLocaleDateString([], { year: '2-digit', month: 'numeric', day: 'numeric' });
 }
 
-function formatFullDate(iso) {
-  return new Date(iso).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+function formatFullDate(iso: string | null): string {
+  return new Date(iso!).toLocaleString([], { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
-function timeAgo(iso) {
-  const mins = Math.floor((Date.now() - new Date(iso)) / 60000);
+function timeAgo(iso: string): string {
+  const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
   if (mins < 1) return 'just now';
   if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
   const hours = Math.floor(mins / 60);
@@ -190,14 +333,14 @@ function timeAgo(iso) {
   return '';
 }
 
-function formatSize(bytes) {
+function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
-function fileIcon(contentType = '', filename = '') {
-  const ext = filename.split('.').pop().toLowerCase();
+function fileIcon(contentType = '', filename = ''): string {
+  const ext = filename.split('.').pop()!.toLowerCase();
   if (contentType.startsWith('image/')) return 'image';
   if (contentType === 'application/pdf' || ext === 'pdf') return 'picture_as_pdf';
   if (contentType === 'text/calendar' || ext === 'ics') return 'calendar_month';
@@ -208,7 +351,7 @@ function fileIcon(contentType = '', filename = '') {
   return 'description';
 }
 
-function prefixSubject(prefix, subject) {
+function prefixSubject(prefix: string, subject: string): string {
   const re = new RegExp(`^${prefix.replace(':', '')}:`, 'i');
   return re.test(subject || '') ? subject : `${prefix} ${subject || ''}`.trim();
 }
@@ -225,7 +368,7 @@ function totals() {
   return t;
 }
 
-function guessProvider(email) {
+function guessProvider(email: string): Inbox.ProviderId | null {
   const domain = String(email).split('@')[1]?.toLowerCase() || '';
   if (['gmail.com', 'googlemail.com'].includes(domain)) return 'gmail';
   if (domain.startsWith('yahoo.') || domain === 'ymail.com') return 'yahoo';
@@ -234,7 +377,8 @@ function guessProvider(email) {
   return null;
 }
 
-function storage(key, value) {
+// Reads (no value) or saves a per-window preference; null when storage is unavailable.
+function storage(key: string, value?: string): string | null | undefined {
   try {
     if (value === undefined) return localStorage.getItem(key);
     localStorage.setItem(key, value);
@@ -245,9 +389,9 @@ function storage(key, value) {
 
 // ---------- routing (state lives in the URL hash, like Gmail) ----------
 
-function readRoute() {
+function readRoute(): Route {
   const p = new URLSearchParams(location.hash.slice(1));
-  const folder = FOLDERS.some((f) => f.key === p.get('f')) ? p.get('f') : 'inbox';
+  const folder = FOLDERS.some((f) => f.key === p.get('f')) ? p.get('f')! : 'inbox';
   return {
     folder,
     account: p.get('a') || 'all',
@@ -258,7 +402,7 @@ function readRoute() {
   };
 }
 
-function go(changes) {
+function go(changes: Partial<Route>): void {
   const r = { ...state.route, ...changes };
   // Leaving a search goes back to the account the list was showing before it.
   if (state.route.q && !r.q && !('account' in changes)) r.account = state.accountBeforeSearch;
@@ -276,13 +420,13 @@ function go(changes) {
   else location.hash = hash;
 }
 
-const listKey = (r) => `${r.folder}|${r.account}|${r.page}|${r.spage}|${r.q}`;
+const listKey = (r: Route) => `${r.folder}|${r.account}|${r.page}|${r.spage}|${r.q}`;
 // The section only shows on the inbox's first page, so that's the only place its page counts.
-const sectionPageOf = (r) =>
+const sectionPageOf = (r: Route) =>
   r.folder === 'inbox' && !r.q && r.page === 1 && state.settings.inboxType !== 'default' ? r.spage : 1;
 // Cache key: the view plus the settings that change what it shows.
 // The same key the main process stores views under (lib/service.js viewKeyOf).
-const cacheKey = (r) =>
+const cacheKey = (r: Route) =>
   JSON.stringify([r.q ? 'search' : r.folder, r.account, r.page, r.q, state.settings.threading, state.settings.inboxType, sectionPageOf(r), state.settings.sectionSize]);
 
 // The account the search bar will search: the last one viewed or picked, else the first.
@@ -291,11 +435,11 @@ function searchAccountId() {
 }
 
 // Picking another account while results are showing searches that account instead.
-function pickSearchAccount(id) {
+function pickSearchAccount(id: string): void {
   state.searchAccount = id;
   storage('searchAccount', id);
   renderTopbar();
-  const q = $('#search-input').value.trim();
+  const q = $<HTMLInputElement>('#search-input').value.trim();
   if (state.route.q && q) go({ q, account: id, page: 1, open: null });
   else $('#search-input').focus();
 }
@@ -308,7 +452,7 @@ function onRoute() {
   // A search always covers exactly one account.
   if (next.q && next.account === 'all') next.account = searchAccountId();
   state.route = next;
-  $('#search-input').value = next.q;
+  $<HTMLInputElement>('#search-input').value = next.q;
   $('#search-form').classList.toggle('has-text', !!next.q);
 
   if (listKey(prev) !== listKey(next) || !state.list) {
@@ -335,10 +479,10 @@ function onRoute() {
 const threadsOf = () => [...(state.list?.sections || []).flatMap((s) => s.threads), ...(state.list?.threads || [])];
 
 // The conversation a key belongs to: its row key or the key of any of its messages.
-const findThread = (key) =>
-  threadsOf().find((t) => t.key === key || t.messages.some((m) => keyOf(m) === key)) || state.bulk?.byKey.get(key);
+const findThread = (key: string | null): Inbox.Thread | undefined =>
+  threadsOf().find((t) => t.key === key || t.messages.some((m) => keyOf(m) === key)) || state.bulk?.byKey.get(key as string);
 
-const isUnifiedInbox = (r) => r.folder === 'inbox' && r.account === 'all' && r.page === 1 && !r.q;
+const isUnifiedInbox = (r: Route) => r.folder === 'inbox' && r.account === 'all' && r.page === 1 && !r.q;
 
 // The main process answers from its local database right away (a "stale"
 // copy) and syncs in the background; the up-to-date view then arrives through
@@ -368,7 +512,7 @@ async function loadList({ silent = false, background = false, fresh = false } = 
     showList(data);
   } catch (err) {
     if (req !== state.listReq) return;
-    if (!state.list) state.list = { total: 0, hasMore: false, sections: [], threads: [], errors: [{ accountId: null, message: err.message }] };
+    if (!state.list) state.list = { total: 0, hasMore: false, sections: [], threads: [], errors: [{ accountId: null, message: (err as Error).message }] };
   } finally {
     if (req === state.listReq) state.loading = false;
   }
@@ -376,7 +520,7 @@ async function loadList({ silent = false, background = false, fresh = false } = 
 }
 
 // Puts a list result on screen (if it's for the current view) and caches it.
-function showList(data) {
+function showList(data: Inbox.ViewResult): boolean {
   state.listCache.set(data.viewKey, data);
   if (data.viewKey !== cacheKey(state.route)) return false;
   state.list = data;
@@ -424,11 +568,11 @@ function updateBadge() {
     : 0;
   if (count === state.badge) return;
   state.badge = count;
-  let image = null;
+  let image: string | null = null;
   if (count) {
     const canvas = document.createElement('canvas');
     canvas.width = canvas.height = 32;
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d')!;
     ctx.fillStyle = '#d93025';
     ctx.beginPath();
     ctx.arc(16, 16, 16, 0, Math.PI * 2);
@@ -461,10 +605,10 @@ async function reloadState() {
 // ---------- conversation view state ----------
 
 // state.thread = { key, folder, accountId, members, expanded: Set, full: Map, showAll, version, error }
-async function openThread(key) {
+async function openThread(key: string): Promise<void> {
   const listed = findThread(key);
   const ref = parseKey(key);
-  const t = {
+  const t: OpenThread = {
     key,
     folder: listed?.folder ?? ref.folder,
     accountId: ref.accountId,
@@ -486,14 +630,14 @@ async function openThread(key) {
     if (state.thread === t) mergeThreadMembers(fresh.messages);
   } catch (err) {
     if (state.thread === t && !t.members.length) {
-      t.error = err.message;
+      t.error = (err as Error).message;
       render();
     }
   }
 }
 
 // Unread messages and the newest one start expanded, as in Gmail.
-function prepareThread(t) {
+function prepareThread(t: OpenThread): void {
   const last = t.members[t.members.length - 1];
   for (const m of t.members) if (m.unread) t.expanded.add(keyOf(m));
   if (last) t.expanded.add(keyOf(last));
@@ -512,10 +656,10 @@ function prepareThread(t) {
 
 // The same email is a different message "copy" in each folder (Gmail keeps one
 // in Inbox and one in All Mail), so a message is recognised by its Message-ID.
-const identity = (m) => (m.messageId ? `${m.accountId}|${m.messageId}` : keyOf(m));
+const identity = (m: Member) => (m.messageId ? `${m.accountId}|${m.messageId}` : keyOf(m));
 
-function mergeThreadMembers(freshIn) {
-  const t = state.thread;
+function mergeThreadMembers(freshIn: Member[]): void {
+  const t = state.thread!; // (only called for the open conversation)
   // Messages you just sent are shown at once as placeholders ("pending") until
   // the server lists the real ones.
   const oldReal = t.members.filter((m) => !m.pending);
@@ -547,7 +691,7 @@ function mergeThreadMembers(freshIn) {
   // nothing flashes or reloads (a message with attachments is loaded for real).
   const swaps = matched
     .map((p) => ({ p, r: t.members.find((m) => !m.pending && m.messageId === p.messageId) }))
-    .filter((x) => x.r);
+    .filter((x): x is { p: Member; r: Member } => Boolean(x.r));
   for (const { p, r } of swaps) {
     const seeded = t.full.get(keyOf(p));
     if (seeded?.data && !p.hasAttachments) {
@@ -598,7 +742,7 @@ function mergeThreadMembers(freshIn) {
 }
 
 // Loads one message's full content; returns a promise that settles when it's there.
-function loadFull(mkey, attempt = 1) {
+function loadFull(mkey: string, attempt = 1): Promise<void> {
   const t = state.thread;
   if (!t) return Promise.resolve();
   const existing = t.full.get(mkey);
@@ -615,7 +759,7 @@ function loadFull(mkey, attempt = 1) {
     .catch((err) => {
       // A message that has only just arrived can take a moment to be readable:
       // retry quietly (the card keeps saying "Loading…") before showing an error.
-      const recent = member && Date.now() - new Date(member.date) < 5 * 60 * 1000;
+      const recent = member && Date.now() - new Date(member.date).getTime() < 5 * 60 * 1000;
       if (recent && attempt < 4) {
         t.full.delete(mkey);
         setTimeout(() => {
@@ -623,7 +767,7 @@ function loadFull(mkey, attempt = 1) {
         }, 1500 * attempt);
         return;
       }
-      t.full.set(mkey, { error: err.message });
+      t.full.set(mkey, { error: (err as Error).message });
     })
     .finally(() => {
       if (state.thread !== t) return;
@@ -635,16 +779,16 @@ function loadFull(mkey, attempt = 1) {
   return promise;
 }
 
-let countsTimer;
+let countsTimer: ReturnType<typeof setTimeout> | undefined;
 function refreshCountsSoon() {
   clearTimeout(countsTimer);
   countsTimer = setTimeout(refreshCounts, 400);
 }
 
 // The newest message of a conversation always stays open, as in Gmail.
-const isLastMember = (t, mkey) => keyOf(t.members[t.members.length - 1]) === mkey;
+const isLastMember = (t: OpenThread, mkey: string) => keyOf(t.members[t.members.length - 1]) === mkey;
 
-function toggleCard(mkey) {
+function toggleCard(mkey: string): void {
   const t = state.thread;
   if (!t) return;
   if (t.expanded.has(mkey)) {
@@ -718,10 +862,10 @@ function renderTopbar() {
 
 // ---------- sender photos ----------
 
-const photos = new Map(); // address -> picture (a data: URL), or null when the sender has none
-const photoAsked = new Set();
-const photoQueue = [];
-let photoTimer;
+const photos = new Map<string, string | null>(); // address -> picture (a data: URL), or null when the sender has none
+const photoAsked = new Set<string>();
+const photoQueue: string[] = [];
+let photoTimer: ReturnType<typeof setTimeout> | undefined;
 
 function askPhotos() {
   while (photoQueue.length) {
@@ -768,7 +912,7 @@ function paintAvatars() {
 function renderSidebar() {
   const r = state.route;
   const t = totals();
-  const countFor = { inbox: t.inbox, spam: t.spam, drafts: t.drafts };
+  const countFor: Record<string, number> = { inbox: t.inbox, spam: t.spam, drafts: t.drafts };
   const folders = FOLDERS.filter((f) => !f.more || state.moreOpen || f.key === r.folder);
   $('#nav-folders').innerHTML =
     folders
@@ -797,7 +941,7 @@ function renderSidebar() {
 }
 
 // The bell beside an account in the sidebar: shown on hover, and always while the account is muted.
-function accountBellHtml(a) {
+function accountBellHtml(a: Inbox.PublicAccount): string {
   const alertsOn = state.settings.notifications;
   const muted = a.notify === false;
   const title = !alertsOn
@@ -843,7 +987,7 @@ function renderListPane() {
   pane.innerHTML = listViewHtml();
   const listEl = $('.list', pane);
   if (listEl && state.listScroll?.sig === sig) listEl.scrollTop = state.listScroll.top;
-  const selectAll = $('#select-all');
+  const selectAll = $<HTMLInputElement>('#select-all');
   if (selectAll) {
     const threads = threadsOf();
     const n = threads.filter((t) => state.selected.has(t.key)).length;
@@ -873,12 +1017,12 @@ function renderReadPane() {
   for (const card of $$('.msg-card.expanded', pane)) mountCardBody(card);
 }
 
-function toolbarButton(icon, title, attrs) {
+function toolbarButton(icon: string, title: string, attrs: string): string {
   return `<button class="icon-btn" ${attrs} title="${title}"><span class="ms">${icon}</span></button>`;
 }
 
-function moveButtons(folder, attr) {
-  const b = [];
+function moveButtons(folder: string, attr: string): string {
+  const b: string[] = [];
   if (folder === 'inbox') b.push(toolbarButton('archive', 'Archive', `${attr}="archive"`));
   if (folder === 'spam') b.push(toolbarButton('report_off', 'Not spam', `${attr}="inbox"`));
   else if (folder !== 'drafts' && folder !== 'sent') b.push(toolbarButton('report', 'Report spam', `${attr}="spam"`));
@@ -895,7 +1039,7 @@ function listViewHtml() {
   const allSelected = threads.length > 0 && pageSelected === threads.length;
   const selCount = state.bulk ? state.bulk.threads.length : pageSelected;
 
-  let actions;
+  let actions: string;
   if (selCount) {
     const anyUnread = (state.bulk ? state.bulk.threads : threads.filter((t) => state.selected.has(t.key))).some((t) => t.unread);
     actions =
@@ -912,7 +1056,7 @@ function listViewHtml() {
   const rest = list?.threads || [];
   // Gmail's "1–50 of 1,234 < >". With sections on screen each one gets its own
   // in its header (attr: which page it turns), so the toolbar shows none.
-  const pager = (page, pageSize, shown, total, hasMore, attr) => {
+  const pager = (page: number, pageSize: number, shown: number, total: number | null, hasMore: boolean, attr: string) => {
     if (!shown && page <= 1) return '';
     const start = (page - 1) * pageSize + 1;
     const of = total == null ? 'many' : total.toLocaleString();
@@ -924,7 +1068,7 @@ function listViewHtml() {
   const sections = (list?.sections || []).filter(
     (s) => !(state.settings.hideEmptySection && !s.threads.length && s.page === 1)
   );
-  const restPager = list ? pager(r.page, list.pageSize, rest.length, list.total, list.hasMore, 'data-page') : '';
+  const restPager = list ? pager(r.page, list.pageSize!, rest.length, list.total, list.hasMore, 'data-page') : '';
   const range = sections.length ? '' : restPager;
 
   const toolbar = `<div class="toolbar">
@@ -945,7 +1089,7 @@ function listViewHtml() {
   }
 
 
-  let body;
+  let body: string;
   if (!list) {
     body = '';
   } else if (r.q && !threads.length && list.errors?.length) {
@@ -957,8 +1101,8 @@ function listViewHtml() {
     body = `<div class="empty"><span class="ms">${icon}</span><b>${title}</b>${sub}</div>`;
   } else {
     const index = new Map(threads.map((t, i) => [t.key, i]));
-    const rows = (list) => list.map((t) => rowHtml(t, index.get(t.key))).join('');
-    const head = (id, title, pages) => {
+    const rows = (list: Inbox.Thread[]) => list.map((t) => rowHtml(t, index.get(t.key))).join('');
+    const head = (id: string, title: string, pages: string) => {
       const collapsed = state.collapsedSections.has(id);
       return `<div class="section-head ${collapsed ? 'collapsed' : ''}" data-section="${id}"><span class="ms">expand_more</span>${title}
         <div class="section-pager">${pages}</div></div>`;
@@ -988,7 +1132,7 @@ function listViewHtml() {
 }
 
 // "Carly" from "Carly Smith", "Helen" from "Prof. Helen Okafor", "Peter" from "Kung, Peter".
-function shortName(addr) {
+function shortName(addr: Inbox.Address | undefined): string {
   let name = String(addr?.name || '').replace(/^"|"$/g, '').trim();
   if (!name) return String(addr?.address || '').split('@')[0];
   if (name.includes(',')) name = name.split(',')[1].trim() || name;
@@ -997,7 +1141,7 @@ function shortName(addr) {
 }
 
 // Gmail's sender column: "Carly, me 9" / "Alice .. Bob, Carol 7" / "To: Bob".
-function participantsHtml(t) {
+function participantsHtml(t: Inbox.Thread): string {
   const r = state.route;
   const first = t.messages[0];
   if (r.folder === 'drafts') return '<span class="draft">Draft</span>';
@@ -1012,7 +1156,7 @@ function participantsHtml(t) {
     people.set(addr, p);
   }
   const list = [...people.values()];
-  const name = (p) => (isMe(p.from.address) ? 'me' : list.length > 1 ? shortName(p.from) : displayName(p.from) || '(unknown sender)');
+  const name = (p: { from: Inbox.Address; unread: boolean }) => (isMe(p.from.address) ? 'me' : list.length > 1 ? shortName(p.from) : displayName(p.from) || '(unknown sender)');
   const shown = list.length > 3 ? [list[0], null, ...list.slice(-2)] : list;
   let out = '';
   shown.forEach((p, i) => {
@@ -1028,17 +1172,17 @@ function participantsHtml(t) {
   return out;
 }
 
-const ROLE_LABELS = { inbox: 'Inbox', trash: 'Trash', spam: 'Spam' };
+const ROLE_LABELS: Record<string, string> = { inbox: 'Inbox', trash: 'Trash', spam: 'Spam' };
 
 // Gmail's importance marker (the yellow "›" next to the star).
-function importanceButton(important, attr) {
+function importanceButton(important: boolean | undefined, attr: string): string {
   const title = important ? 'Important. Click to mark as not important.' : 'Click to mark as important.';
   return `<button class="icon-btn imp-btn ${important ? 'on' : ''}" ${attr} title="${title}"><span class="ms">label_important</span></button>`;
 }
 
 // ---------- read tracking marks (like Mailsuite) ----------
 
-function trackText(track) {
+function trackText(track: Inbox.TrackStatus): string {
   if (!track.opens) return 'Sent · not opened yet';
   const times = track.opens === 1 ? 'Opened' : `Opened ${track.opens} times`;
   const app = track.client && track.client !== 'Other' ? ` · ${track.client}` : '';
@@ -1046,21 +1190,21 @@ function trackText(track) {
 }
 
 // ✓ sent (gray) / ✓✓ opened (green), as on list rows.
-function trackMark(track) {
+function trackMark(track: Inbox.TrackStatus | null | undefined): string {
   if (!track) return '';
   const opened = track.opens > 0;
   return `<span class="ms track-mark ${opened ? 'opened' : ''}" title="${esc(trackText(track))}">${opened ? 'done_all' : 'done'}</span>`;
 }
 
 // The line under one of your tracked messages in a conversation.
-function trackLineHtml(m) {
+function trackLineHtml(m: Member): string {
   if (!m.track) return '';
   const opened = m.track.opens > 0;
   return `<div class="track-line ${opened ? 'opened' : ''}"><span class="ms">${opened ? 'done_all' : 'done'}</span>${esc(trackText(m.track))}</div>`;
 }
 
 // Gmail-style attachment pills under a row (Default density).
-function filesHtml(t) {
+function filesHtml(t: Inbox.Thread): string {
   if (state.settings.density !== 'default' || !t.files?.length) return '';
   const pills = t.files
     .slice(0, 2)
@@ -1070,7 +1214,7 @@ function filesHtml(t) {
   return `<div class="row-files">${pills}${more}</div>`;
 }
 
-function rowHtml(t, i) {
+function rowHtml(t: Inbox.Thread, i: number | undefined): string {
   const r = state.route;
   const a = accountById(t.accountId);
   const selected = state.selected.has(t.key);
@@ -1110,17 +1254,17 @@ function rowHtml(t, i) {
 function threadToolbarHtml() {
   const r = state.route;
   const threads = threadsOf();
-  const idx = threads.indexOf(findThread(r.open));
+  const idx = threads.indexOf(findThread(r.open)!);
   const of = state.list?.total == null ? 'many' : state.list.total.toLocaleString();
   const nav =
     idx >= 0
-      ? `<span class="range">${((r.page - 1) * (state.list.pageSize || 50) + idx + 1).toLocaleString()} of ${of}</span>
+      ? `<span class="range">${((r.page - 1) * (state.list!.pageSize || 50) + idx + 1).toLocaleString()} of ${of}</span>
         ${toolbarButton('chevron_left', 'Newer', `data-step="-1" ${idx <= 0 ? 'disabled' : ''}`)}
         ${toolbarButton('chevron_right', 'Older', `data-step="1" ${idx >= threads.length - 1 ? 'disabled' : ''}`)}`
       : '';
   const back = splitPane()
     ? toolbarButton('close', 'Close', 'data-back')
-    : toolbarButton('arrow_back', `Back to ${r.q ? 'search results' : FOLDERS.find((f) => f.key === r.folder).label}`, 'data-back');
+    : toolbarButton('arrow_back', `Back to ${r.q ? 'search results' : FOLDERS.find((f) => f.key === r.folder)!.label}`, 'data-back');
   return `<div class="toolbar">
     ${back}
     ${moveButtons(r.folder, 'data-msg-act')}
@@ -1130,7 +1274,7 @@ function threadToolbarHtml() {
   </div>`;
 }
 
-function threadViewHtml() {
+function threadViewHtml(): string {
   const t = state.thread;
   const toolbar = threadToolbarHtml();
   if (t?.error) return `${toolbar}<div class="msg-view"><div class="msg-error"><span class="ms">error</span> ${esc(t.error)}</div></div>`;
@@ -1139,7 +1283,7 @@ function threadViewHtml() {
   const r = state.route;
   // Search results can come from anywhere, so show where the conversation actually is.
   const labels = r.q
-    ? [...new Set(t.members.map((m) => ROLE_LABELS[m.role]).filter(Boolean))]
+    ? [...new Set(t.members.map((m) => ROLE_LABELS[m.role as string]).filter(Boolean))]
     : [FOLDERS.find((f) => f.key === r.folder)?.label].filter(Boolean);
   const subject = t.members[0].subject || t.members[t.members.length - 1].subject;
   return `${toolbar}<div class="msg-view">
@@ -1153,9 +1297,9 @@ function threadViewHtml() {
 }
 
 // Long conversations hide the middle read messages behind a "N" bubble.
-function cardsHtml(t) {
+function cardsHtml(t: OpenThread): string {
   const n = t.members.length;
-  const hidden = new Set();
+  const hidden = new Set<number>();
   if (!t.showAll && n > 4) {
     for (let i = 1; i < n - 2; i++) if (!t.expanded.has(keyOf(t.members[i]))) hidden.add(i);
     if (hidden.size < 2) hidden.clear();
@@ -1173,8 +1317,8 @@ function cardsHtml(t) {
   return out;
 }
 
-function cardHtml(m) {
-  const t = state.thread;
+function cardHtml(m: Member): string {
+  const t = state.thread!;
   const k = keyOf(m);
   if (!t.expanded.has(k)) {
     // Like Gmail: the full date with "(6 days ago)", and the message's own star.
@@ -1189,7 +1333,7 @@ function cardHtml(m) {
         <button class="icon-btn star-btn ${m.starred ? 'on' : ''}" data-card-star title="${m.starred ? 'Starred' : 'Not starred'}"><span class="ms">star</span></button></div>
     </div>`;
   }
-  const f = t.full.get(k) || {};
+  const f: FullEntry = t.full.get(k) || {};
   const d = f.data;
   const from = d?.from || m.from;
   const recipients = d ? [...d.to, ...d.cc] : m.to;
@@ -1198,7 +1342,7 @@ function cardHtml(m) {
   const ago = timeAgo(date);
   const a = accountById(m.accountId);
   const starred = m.starred;
-  let body;
+  let body: string;
   if (d) {
     const prepared = f.body || (f.body = prepareBody(d));
     body = '<iframe title="Message body" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"></iframe>';
@@ -1250,40 +1394,40 @@ const QUOTE_SELECTORS = [
 // Outlook starts the quoted part with one of these; it and everything after it is history.
 const OUTLOOK_QUOTE_START = ['#divRplyFwdMsg', '#appendonsend', 'div[id*="divRplyFwdMsg"]'];
 
-const isForwarded = (subject) => /^\s*(fwd?|fw)\s*:/i.test(subject || '');
+const isForwarded = (subject: string | undefined) => /^\s*(fwd?|fw)\s*:/i.test(subject || '');
 
 // True when nothing but whitespace follows `el` inside `root`.
-function nothingAfter(el, root) {
-  for (let node = el; node && node !== root; node = node.parentNode) {
+function nothingAfter(el: Node, root: Node): boolean {
+  for (let node: Node | null = el; node && node !== root; node = node.parentNode) {
     for (let s = node.nextSibling; s; s = s.nextSibling) {
-      if (s.textContent.trim() || (s.nodeType === 1 && s.querySelector('img'))) return false;
+      if (s.textContent!.trim() || (s.nodeType === 1 && (s as Element).querySelector('img'))) return false;
     }
   }
   return true;
 }
 
 // Marks quoted history in an HTML email with data-ui-quote so it starts hidden.
-function trimHtmlQuotes(html, subject) {
+function trimHtmlQuotes(html: string, subject: string): PreparedBody {
   if (!html || isForwarded(subject)) return { html, trimmed: false };
   const doc = new DOMParser().parseFromString(html, 'text/html'); // inert: no scripts, no loads
-  const marked = [];
-  const mark = (el) => {
+  const marked: Element[] = [];
+  const mark = (el: Element | null) => {
     if (!el || el.closest('[data-ui-quote]')) return;
     el.setAttribute('data-ui-quote', '');
     marked.push(el);
   };
   for (const el of doc.querySelectorAll(QUOTE_SELECTORS)) {
-    if (!/^-{4,}\s*Forwarded message/i.test(el.textContent.trim())) mark(el);
+    if (!/^-{4,}\s*Forwarded message/i.test(el.textContent!.trim())) mark(el);
   }
   for (const sel of OUTLOOK_QUOTE_START) {
     const start = doc.querySelector(sel);
     if (!start) continue;
     if (start.previousElementSibling?.tagName === 'HR') mark(start.previousElementSibling);
-    for (let el = start; el; el = el.nextElementSibling) mark(el);
+    for (let el: Element | null = start; el; el = el.nextElementSibling) mark(el);
   }
   // Other apps: a plain <blockquote> at the very end of the message.
   if (!marked.length) {
-    const last = [...doc.body.querySelectorAll('blockquote')].filter((b) => !b.parentElement.closest('blockquote')).pop();
+    const last = [...doc.body.querySelectorAll('blockquote')].filter((b) => !b.parentElement!.closest('blockquote')).pop();
     if (last && nothingAfter(last, doc.body)) mark(last);
   }
   // The "On ..., X wrote:" line right before a quote.
@@ -1294,13 +1438,13 @@ function trimHtmlQuotes(html, subject) {
   }
   if (!marked.length) return { html, trimmed: false };
   // Never hide the whole message.
-  const visible = doc.body.cloneNode(true);
+  const visible = doc.body.cloneNode(true) as HTMLElement;
   visible.querySelectorAll('[data-ui-quote]').forEach((el) => el.remove());
-  if (!visible.textContent.trim() && !visible.querySelector('img')) return { html, trimmed: false };
+  if (!visible.textContent!.trim() && !visible.querySelector('img')) return { html, trimmed: false };
   return { html: doc.documentElement.outerHTML, trimmed: true };
 }
 
-function plainToHtml(text) {
+function plainToHtml(text: string): string {
   const linked = esc(text).replace(/\bhttps?:\/\/[^\s<]+[^\s<.,;:!?)\]'"]/g, (url) => `<a href="${url}">${url}</a>`);
   return linked
     .split(/\n{2,}/)
@@ -1309,7 +1453,7 @@ function plainToHtml(text) {
 }
 
 // Plain-text replies: a trailing block of "> " lines (plus its "On ... wrote:" line).
-function trimPlainQuotes(text, subject) {
+function trimPlainQuotes(text: string, subject: string): string | null {
   if (isForwarded(subject)) return null;
   const lines = String(text || '').replace(/\s+$/, '').split(/\r?\n/);
   const first = lines.findIndex((l) => /^\s*>/.test(l));
@@ -1329,7 +1473,7 @@ function trimPlainQuotes(text, subject) {
   return `${plainToHtml(visible)}<div data-ui-quote>${plainToHtml(lines.slice(start).join('\n'))}</div>`;
 }
 
-function prepareBody(d) {
+function prepareBody(d: Inbox.FullMessage): PreparedBody {
   if (d.plain) {
     const html = trimPlainQuotes(d.text, d.subject);
     if (html) return { html, trimmed: true };
@@ -1337,7 +1481,7 @@ function prepareBody(d) {
   return trimHtmlQuotes(d.html, d.subject);
 }
 
-function attachmentsHtml(m) {
+function attachmentsHtml(m: Inbox.FullMessage): string {
   if (!m.attachments.length) return '';
   return `<div class="attachments"><div class="attachments-head">${m.attachments.length === 1 ? 'One attachment' : `${m.attachments.length} attachments`}</div>
     <div class="att-grid">${m.attachments
@@ -1351,8 +1495,9 @@ function attachmentsHtml(m) {
       .join('')}</div></div>`;
 }
 
-function threadActionsHtml() {
-  const t = state.thread;
+function threadActionsHtml(): string {
+  // (only called while a conversation is open)
+  const t = state.thread!;
   const last = t.members[t.members.length - 1];
   const d = t.full.get(keyOf(last))?.data;
   const recipients = d ? [...d.to, ...d.cc] : last.to;
@@ -1364,7 +1509,7 @@ function threadActionsHtml() {
 }
 
 // Re-renders one message card in place (other cards keep their loaded iframes).
-function renderCard(mkey) {
+function renderCard(mkey: string): void {
   const t = state.thread;
   const el = $(`.msg-card[data-mkey="${CSS.escape(mkey)}"]`);
   const m = t?.members.find((x) => keyOf(x) === mkey);
@@ -1372,17 +1517,17 @@ function renderCard(mkey) {
   el.outerHTML = cardHtml(m);
   const card = $(`.msg-card[data-mkey="${CSS.escape(mkey)}"]`);
   if (card.classList.contains('expanded')) mountCardBody(card);
-  if (m === t.members[t.members.length - 1]) $('.thread-actions').innerHTML = threadActionsHtml();
+  if (m === t!.members[t!.members.length - 1]) $('.thread-actions').innerHTML = threadActionsHtml();
 }
 
 // Email HTML is rendered in a sandboxed iframe: no scripts, links open in
 // the default browser.
-function mountCardBody(card) {
-  const iframe = $('.msg-body iframe', card);
-  const f = state.thread?.full.get(card.dataset.mkey);
+function mountCardBody(card: HTMLElement): void {
+  const iframe = $<HTMLIFrameElement>('.msg-body iframe', card);
+  const f = state.thread?.full.get(card.dataset.mkey!);
   const data = f?.data;
   if (!iframe || !data) return;
-  const prepared = f.body || (f.body = prepareBody(data));
+  const prepared = f!.body || (f!.body = prepareBody(data));
   // Dark mode: plain-text mail gets light text; designed HTML mail keeps its
   // own colors on a white sheet so it stays readable.
   const dark = matchMedia('(prefers-color-scheme: dark)').matches;
@@ -1411,7 +1556,7 @@ function mountCardBody(card) {
     // Size the frame to the content (measured on the body so it can also shrink
     // when quoted text is hidden again).
     const fit = () => {
-      const bottom = doc.body.getBoundingClientRect().bottom + parseFloat(getComputedStyle(doc.body).marginBottom || 0);
+      const bottom = doc.body.getBoundingClientRect().bottom + parseFloat(getComputedStyle(doc.body).marginBottom || (0 as unknown as string));
       iframe.style.height = `${Math.ceil(Math.max(bottom, doc.body.scrollHeight))}px`;
     };
     fit();
@@ -1427,7 +1572,7 @@ function patchThreadView() {
 
 // ---------- actions ----------
 
-const ACTION_TEXT = {
+const ACTION_TEXT: Partial<Record<Inbox.Action, string>> = {
   archive: 'archived',
   trash: 'moved to Trash',
   spam: 'marked as spam',
@@ -1437,7 +1582,7 @@ const ACTION_TEXT = {
 };
 
 // A conversation by key: the open one (with every message loaded), or a list row.
-function threadByKey(key) {
+function threadByKey(key: string | null): ActionTarget | undefined {
   const t = state.thread;
   if (t && (t.key === key || t.members.some((m) => keyOf(m) === key)) && t.members.length) {
     // (a message you just sent isn't on the server's list yet: nothing to act on)
@@ -1447,10 +1592,10 @@ function threadByKey(key) {
 }
 
 // Which messages of a conversation an action touches, following Gmail.
-function itemsFor(action, t) {
+function itemsFor(action: Inbox.Action, t: ActionTarget): Inbox.ActionItem[] {
   const ms = t.messages;
   const theirs = ms.filter((m) => !isMe(m.from.address));
-  let pick;
+  let pick: Member[];
   switch (action) {
     case 'archive': // the backend only takes inbox copies out of the inbox
     case 'trash':
@@ -1495,7 +1640,7 @@ function itemsFor(action, t) {
 }
 
 // Updates read/star state everywhere a message is shown, before the server confirms.
-function applyLocal(action, items) {
+function applyLocal(action: Inbox.Action, items: Inbox.MessageRef[]): void {
   const keys = new Set(items.map(keyOf));
   for (const ms of [...threadsOf().map((t) => t.messages), ...(state.bulk?.threads.map((t) => t.messages) || []), state.thread?.members || []]) {
     for (const m of ms) {
@@ -1521,8 +1666,8 @@ function applyLocal(action, items) {
   }
 }
 
-async function doAction(action, keys) {
-  const threads = keys.map(threadByKey).filter(Boolean);
+async function doAction(action: Inbox.Action, keys: (string | null)[]): Promise<void> {
+  const threads = keys.map(threadByKey).filter((t): t is ActionTarget => Boolean(t));
   if (!threads.length) return;
   const r = state.route;
   const everything = !!state.bulk && keys.length === state.bulk.threads.length; // "all N conversations" is selected
@@ -1544,7 +1689,7 @@ async function doAction(action, keys) {
   if (moving) state.bulk = null;
   if (moving && state.list) {
     const gone = new Set(threads.map((x) => findThread(x.key)).filter(Boolean));
-    const keep = (t) => !gone.has(t) && !rowKeys.has(t.key);
+    const keep = (t: Inbox.Thread) => !gone.has(t) && !rowKeys.has(t.key);
     const before = state.list.threads.length;
     state.list.threads = state.list.threads.filter(keep);
     for (const s of state.list.sections || []) {
@@ -1572,7 +1717,7 @@ async function doAction(action, keys) {
       snack(`${what} ${text}.${rest}`);
     }
   } catch (err) {
-    snack(err.message);
+    snack((err as Error).message);
     loadList({ silent: true });
   }
   refreshCounts();
@@ -1582,7 +1727,7 @@ async function doAction(action, keys) {
 }
 
 // Star or unstar one message inside the open conversation.
-async function toggleMessageStar(mkey) {
+async function toggleMessageStar(mkey: string): Promise<void> {
   const t = state.thread;
   const m = t?.members.find((x) => keyOf(x) === mkey);
   if (!m) return;
@@ -1594,7 +1739,7 @@ async function toggleMessageStar(mkey) {
   try {
     await api.act({ action, items });
   } catch (err) {
-    snack(err.message);
+    snack((err as Error).message);
   }
 }
 
@@ -1608,26 +1753,26 @@ function targetKeys() {
   return threadsOf().some((t) => t.key === state.focusKey) ? [state.focusKey] : [];
 }
 
-function toggleImportant(key) {
+function toggleImportant(key: string): void {
   const t = threadByKey(key);
   if (!t) return;
   doAction(t.messages.some((m) => m.important) ? 'unimportant' : 'important', [key]);
 }
 
-function toggleStar(key) {
+function toggleStar(key: string): void {
   const t = threadByKey(key);
   if (!t) return;
   doAction(t.messages.some((m) => m.starred) ? 'unstar' : 'star', [key]);
 }
 
-function stepMessage(delta) {
+function stepMessage(delta: number): void {
   const threads = threadsOf();
-  const idx = threads.indexOf(findThread(state.route.open));
+  const idx = threads.indexOf(findThread(state.route.open)!);
   const next = threads[idx + delta];
   if (idx >= 0 && next) go({ open: next.key });
 }
 
-function selectWhere(pred) {
+function selectWhere(pred: (t: Inbox.Thread) => boolean): void {
   state.selected.clear();
   state.bulk = null;
   for (const t of threadsOf()) if (pred(t)) state.selected.add(t.key);
@@ -1646,7 +1791,7 @@ async function selectEverything() {
     // (newest first, as in the list; rows already ticked stay ticked)
     state.bulk = { threads: all.threads, byKey: new Map(all.threads.map((t) => [t.key, t])), complete: all.complete };
   } catch (err) {
-    snack(err.message);
+    snack((err as Error).message);
   } finally {
     state.bulkLoading = false;
   }
@@ -1656,7 +1801,7 @@ async function selectEverything() {
 const folderLabel = () => (state.route.q ? 'search results' : FOLDERS.find((f) => f.key === state.route.folder)?.label || 'this view');
 
 // The strip under the toolbar once every row on the page is ticked.
-function selectBannerHtml(threads, allSelected) {
+function selectBannerHtml(threads: Inbox.Thread[], allSelected: boolean): string {
   const list = state.list;
   if (state.bulk) {
     const n = state.bulk.threads.length;
@@ -1681,8 +1826,8 @@ function defaultFrom() {
 // ---------- recipients (chips) ----------
 
 // "Name <a@b.com>, c@d.com" -> [{ name, address }], respecting quotes and <...>.
-function splitAddresses(text) {
-  const parts = [];
+function splitAddresses(text: unknown): Inbox.Address[] {
+  const parts: string[] = [];
   let cur = '';
   let inQuote = false;
   let inAngle = false;
@@ -1699,17 +1844,17 @@ function splitAddresses(text) {
   return parts.map((p) => p.trim()).filter(Boolean).map(parseAddress);
 }
 
-function parseAddress(token) {
+function parseAddress(token: string): Inbox.Address {
   const m = token.match(/^(.*?)<([^<>]+)>\s*$/);
   if (m) return { name: m[1].trim().replace(/^"|"$/g, ''), address: m[2].trim() };
   return { name: '', address: token.replace(/^<|>$/g, '').trim() };
 }
 
-const looksLikeAddress = (a) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(a.address);
-const toAddressList = (v) => (Array.isArray(v) ? v : splitAddresses(v)).filter((a) => a?.address);
-const RCPT_FIELDS = ['to', 'cc', 'bcc'];
+const looksLikeAddress = (a: Inbox.Address) => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(a.address);
+const toAddressList = (v: Inbox.Address[] | string) => (Array.isArray(v) ? v : splitAddresses(v)).filter((a) => a?.address);
+const RCPT_FIELDS: RcptField[] = ['to', 'cc', 'bcc'];
 
-function renderChips(field) {
+function renderChips(field: RcptField): void {
   const c = state.compose;
   const el = $(`.compose .rcpt-box[data-field="${field}"] .rcpt-chips`);
   if (!c || !el) return;
@@ -1723,9 +1868,9 @@ function renderChips(field) {
 
 // Turns typed text into chips. final: also the part after the last separator
 // (on Enter, Tab and when leaving the field); text that isn't an address stays typed.
-function commitRecipients(field, final = true) {
+function commitRecipients(field: RcptField, final = true): void {
   const c = state.compose;
-  const input = $(`.compose [name=${field}]`);
+  const input = $<HTMLInputElement>(`.compose [name=${field}]`);
   if (!c || !input || !input.value.trim()) return;
   let complete = input.value;
   let rest = '';
@@ -1749,14 +1894,14 @@ function composeHasContent() {
   const c = state.compose;
   if (!root || !c) return false;
   return (
-    RCPT_FIELDS.some((f) => c.chips[f].length || root.querySelector(`[name=${f}]`).value.trim()) ||
-    root.querySelector('[name=subject]').value.trim() !== '' ||
-    root.querySelector('textarea').value.trim() !== '' ||
+    RCPT_FIELDS.some((f) => c.chips[f].length || $<HTMLInputElement>(`[name=${f}]`, root).value.trim()) ||
+    $<HTMLInputElement>('[name=subject]', root).value.trim() !== '' ||
+    $<HTMLTextAreaElement>('textarea', root).value.trim() !== '' ||
     c.files.length > 0
   );
 }
 
-function openCompose(opts = {}) {
+function openCompose(opts: ComposeOptions = {}): void {
   if (state.compose && composeHasContent()) {
     $('.compose').classList.remove('min');
     snack('Finish or discard the message you are writing first.');
@@ -1789,7 +1934,7 @@ function renderCompose() {
     return;
   }
   const showCc = !!(c.chips.cc.length || c.chips.bcc.length);
-  const rcpt = (field, label, extra = '', hidden = false) => `<div class="cfield rcpt ${hidden ? 'hidden' : ''}"><label>${label}</label>
+  const rcpt = (field: RcptField, label: string, extra = '', hidden = false) => `<div class="cfield rcpt ${hidden ? 'hidden' : ''}"><label>${label}</label>
     <div class="rcpt-box" data-field="${field}"><span class="rcpt-chips"></span><input name="${field}" spellcheck="false" autocomplete="off"></div>${extra}</div>`;
   root.innerHTML = `<div class="compose">
     <div class="compose-head" data-c-toggle>
@@ -1824,7 +1969,7 @@ function renderCompose() {
   </div>`;
   renderComposeFiles();
   RCPT_FIELDS.forEach(renderChips);
-  const body = $('.compose textarea');
+  const body = $<HTMLTextAreaElement>('.compose textarea');
   // Set via .value: HTML parsing would drop a leading newline inside <textarea>.
   body.value = c.body;
   if (!c.chips.to.length) $('.compose [name=to]').focus();
@@ -1834,7 +1979,7 @@ function renderCompose() {
   }
 }
 
-function trackToggleHtml(c) {
+function trackToggleHtml(c: Compose): string {
   const title = !state.tracking.configured
     ? 'Read tracking: set up a tracker to see when your emails are opened'
     : c.track
@@ -1844,7 +1989,7 @@ function trackToggleHtml(c) {
 }
 
 function renderComposeFiles() {
-  const c = state.compose;
+  const c = state.compose!;
   const el = $('.compose-files');
   if (!el) return;
   el.innerHTML =
@@ -1856,14 +2001,14 @@ function renderComposeFiles() {
       .join('');
 }
 
-async function addComposeFiles(files) {
+async function addComposeFiles(files: File[]): Promise<void> {
   const c = state.compose;
   if (!c || !files.length) return;
   const read = await Promise.allSettled(
     files.map(async (file) => ({ filename: file.name, contentType: file.type, data: new Uint8Array(await file.arrayBuffer()) })),
   );
   if (state.compose !== c) return;
-  const ok = read.filter((r) => r.status === 'fulfilled').map((r) => r.value);
+  const ok = read.filter((r) => r.status === 'fulfilled').map((r) => (r as PromiseFulfilledResult<Inbox.OutgoingAttachment>).value);
   c.files.push(...ok);
   $('.compose')?.classList.remove('min');
   renderComposeFiles();
@@ -1884,11 +2029,11 @@ function closeCompose() {
 // Shows a message you just sent in the open conversation right away (the
 // server can take a few seconds to list it); the real message then replaces it.
 let pendingSeq = 0;
-function addPendingMessage(mail, result, c) {
+function addPendingMessage(mail: Inbox.OutgoingMail, result: Inbox.SendResult, c: Compose): void {
   const t = state.thread;
   const acct = accountById(mail.account);
   if (!t || !acct || !c.inReplyTo || !t.members.some((m) => m.messageId === c.inReplyTo)) return;
-  const pending = {
+  const pending: Member = {
     accountId: acct.id,
     folder: 'pending',
     uid: -(++pendingSeq),
@@ -1916,7 +2061,7 @@ function addPendingMessage(mail, result, c) {
     data: {
       accountId: pending.accountId, folder: pending.folder, uid: pending.uid, subject: pending.subject,
       from: pending.from, to: c.chips.to, cc: c.chips.cc, replyTo: [], date: pending.date,
-      html: result.html, plain: false, text: result.text, messageId: pending.messageId,
+      html: result.html, plain: false, text: result.text, messageId: pending.messageId!,
       references: pending.references, attachments: [],
     },
   });
@@ -1924,7 +2069,7 @@ function addPendingMessage(mail, result, c) {
   const cards = $('#pane-read .thread-cards');
   if (!cards) return;
   cards.insertAdjacentHTML('beforeend', cardHtml(pending));
-  mountCardBody(cards.lastElementChild);
+  mountCardBody(cards.lastElementChild as HTMLElement);
   const actions = $('#pane-read .thread-actions');
   if (actions) actions.innerHTML = threadActionsHtml();
   const view = $('#pane-read .msg-view');
@@ -1933,7 +2078,7 @@ function addPendingMessage(mail, result, c) {
 
 // Servers take a moment to list a message you just sent: look again a few
 // times, until the open conversation has the real message.
-function refreshAfterSend(attempt = 0) {
+function refreshAfterSend(attempt = 0): void {
   const delays = [1500, 4000, 8000, 14000];
   setTimeout(async () => {
     await Promise.allSettled([loadList({ silent: true, fresh: true }), refreshOpenThread()]);
@@ -1944,23 +2089,23 @@ function refreshAfterSend(attempt = 0) {
 
 async function sendCompose() {
   const root = $('.compose');
-  const c = state.compose;
-  const val = (n) => root.querySelector(`[name=${n}]`).value.trim();
+  const c = state.compose!;
+  const val = (n: string) => root.querySelector<HTMLInputElement>(`[name=${n}]`)!.value.trim();
   RCPT_FIELDS.forEach((f) => commitRecipients(f, true));
   const leftover = RCPT_FIELDS.find((f) => val(f));
   if (leftover) {
     snack(`"${val(leftover)}" isn't a valid email address.`);
-    root.querySelector(`[name=${leftover}]`).focus();
+    root.querySelector(`[name=${leftover}]`)!.focus();
     return;
   }
-  const list = (f) => c.chips[f].map(formatAddress).join(', ');
-  const mail = {
+  const list = (f: RcptField) => c.chips[f].map(formatAddress).join(', ');
+  const mail: Inbox.OutgoingMail = {
     account: val('from'),
     to: list('to'),
     cc: list('cc'),
     bcc: list('bcc'),
     subject: val('subject'),
-    text: root.querySelector('textarea').value,
+    text: root.querySelector<HTMLTextAreaElement>('textarea')!.value,
     quote: c.quote,
     inReplyTo: c.inReplyTo,
     references: c.references,
@@ -1970,7 +2115,7 @@ async function sendCompose() {
   };
   if (!mail.to && !mail.cc && !mail.bcc) {
     snack('Please specify at least one recipient.');
-    root.querySelector('[name=to]').focus();
+    root.querySelector('[name=to]')!.focus();
     return;
   }
   if (!mail.subject && !mail.text.trim() && !(await confirmDialog('Send without a subject?', 'Send this message without a subject or text in the body?', 'Send'))) {
@@ -1992,15 +2137,15 @@ async function sendCompose() {
     refreshAfterSend();
   } catch (err) {
     sendsInFlight--;
-    restoreUnsent(c, `Couldn't send "${mail.subject || '(no subject)'}": ${err.message}`);
+    restoreUnsent(c, `Couldn't send "${mail.subject || '(no subject)'}": ${(err as Error).message}`);
   }
 }
 
 let sendsInFlight = 0;
-const unsent = []; // messages that failed to send while another draft was open
+const unsent: Compose[] = []; // messages that failed to send while another draft was open
 
 // Brings back a message that failed to send, so it can be fixed and sent again.
-function restoreUnsent(c, message) {
+function restoreUnsent(c: Compose, message: string): void {
   if (!state.compose || !composeHasContent()) {
     state.compose = c;
     renderCompose();
@@ -2019,13 +2164,13 @@ function openUnsent() {
     snack('Finish or discard the message you are writing first.', { action: { label: 'Open', run: openUnsent } });
     return;
   }
-  state.compose = unsent.shift();
+  state.compose = unsent.shift()!;
   renderCompose();
 }
 
 // Reply / reply all / forward for one message of the open conversation
 // (the newest one when mkey is omitted).
-async function startReply(mode, mkey) {
+async function startReply(mode: 'reply' | 'all' | 'forward', mkey?: string): Promise<void> {
   const t = state.thread;
   if (!t?.members.length) return;
   mkey = mkey || keyOf(t.members[t.members.length - 1]);
@@ -2057,7 +2202,7 @@ async function startReply(mode, mkey) {
   const replying = accountById(m.accountId);
   const fromMe = !!replying && String(m.from.address).toLowerCase() === replying.email.toLowerCase();
   const to = fromMe ? m.to : m.replyTo.length ? m.replyTo : [m.from];
-  let cc = [];
+  let cc: Inbox.Address[] = [];
   if (mode === 'all') {
     const seen = new Set(to.map((x) => x.address.toLowerCase()));
     cc = [...m.to, ...m.cc].filter((x) => {
@@ -2086,13 +2231,13 @@ function closePopover() {
   $('#popover-root').innerHTML = '';
 }
 
-function openMenu(anchor, items) {
+function openMenu(anchor: HTMLElement, items: MenuItem[]): void {
   closePopover();
   const rect = anchor.getBoundingClientRect();
   const root = $('#popover-root');
   // Items: { label, run, icon?, checked?, disabled? }, '-' for a divider, { heading } for a group title.
   // When any item has `checked`, every row keeps room for the check mark, like Gmail's menus.
-  const checks = items.some((it) => it.checked !== undefined);
+  const checks = items.some((it) => (it as MenuEntry).checked !== undefined);
   root.innerHTML = `<div class="menu ${checks ? 'checks' : ''}">${items
     .map((it, i) => {
       if (it === '-') return '<div class="menu-sep"></div>';
@@ -2101,16 +2246,16 @@ function openMenu(anchor, items) {
       return `<button data-mi="${i}" ${it.disabled ? 'disabled' : ''}>${lead}${esc(it.label)}</button>`;
     })
     .join('')}</div>`;
-  const menu = root.firstElementChild;
+  const menu = root.firstElementChild as HTMLElement;
   const left = Math.min(rect.left, window.innerWidth - menu.offsetWidth - 8);
   const top = rect.bottom + menu.offsetHeight > window.innerHeight - 8 ? rect.top - menu.offsetHeight : rect.bottom;
   menu.style.left = `${Math.max(8, left)}px`;
   menu.style.top = `${Math.max(8, top)}px`;
   menu.addEventListener('click', (e) => {
-    const btn = e.target.closest('[data-mi]');
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('[data-mi]');
     if (!btn || btn.disabled) return;
     closePopover();
-    items[Number(btn.dataset.mi)].run();
+    (items[Number(btn.dataset.mi)] as MenuEntry).run!();
   });
 }
 
@@ -2144,17 +2289,17 @@ function openAccountMenu() {
   </div>`;
 }
 
-function showModal(html, { small = false } = {}) {
+function showModal(html: string, { small = false } = {}): HTMLElement {
   const root = $('#modal-root');
   root.innerHTML = `<div class="modal-backdrop"><div class="modal ${small ? 'small' : ''}">${html}</div></div>`;
-  const backdrop = root.firstElementChild;
+  const backdrop = root.firstElementChild as HTMLElement;
   backdrop.addEventListener('mousedown', (e) => {
     if (e.target === backdrop) closeModal();
   });
   backdrop.addEventListener('click', (e) => {
-    if (e.target.closest('[data-close]')) closeModal();
+    if ((e.target as HTMLElement).closest('[data-close]')) closeModal();
   });
-  return backdrop.firstElementChild;
+  return backdrop.firstElementChild as HTMLElement;
 }
 
 function closeModal() {
@@ -2163,28 +2308,29 @@ function closeModal() {
 
 const modalOpen = () => !!$('#modal-root').firstElementChild;
 
-function confirmDialog(title, text, okLabel = 'OK', danger = false) {
-  return new Promise((resolve) => {
+function confirmDialog(title: string, text: string, okLabel = 'OK', danger = false): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
     const modal = showModal(
       `<div class="modal-head"><h2>${esc(title)}</h2></div>
       <div class="modal-body">${esc(text)}</div>
       <div class="modal-foot"><button class="btn plain" data-no>Cancel</button><button class="btn ${danger ? 'danger' : 'primary'}" data-yes>${esc(okLabel)}</button></div>`,
       { small: true }
     );
-    const done = (v) => {
+    const done = (v: boolean) => {
       closeModal();
       resolve(v);
     };
-    modal.querySelector('[data-yes]').addEventListener('click', () => done(true));
-    modal.querySelector('[data-no]').addEventListener('click', () => done(false));
-    modal.parentElement.addEventListener('mousedown', (e) => e.target === modal.parentElement && resolve(false));
-    modal.querySelector('[data-yes]').focus();
+    $('[data-yes]', modal).addEventListener('click', () => done(true));
+    $('[data-no]', modal).addEventListener('click', () => done(false));
+    const backdrop = modal.parentElement!;
+    backdrop.addEventListener('mousedown', (e) => e.target === backdrop && resolve(false));
+    $('[data-yes]', modal).focus();
   });
 }
 
-let snackTimer;
-let snackAction = null;
-async function copyText(text, done) {
+let snackTimer: ReturnType<typeof setTimeout> | undefined;
+let snackAction: SnackAction | null = null;
+async function copyText(text: string, done: string): Promise<void> {
   try {
     await navigator.clipboard.writeText(text);
     snack(done);
@@ -2193,7 +2339,7 @@ async function copyText(text, done) {
   }
 }
 
-function snack(text, { persist = false, action = null } = {}) {
+function snack(text: string, { persist = false, action = null }: { persist?: boolean; action?: SnackAction | null } = {}): void {
   const el = $('#snackbar');
   snackAction = action;
   el.innerHTML = `<span class="grow">${esc(text)}</span>${action ? `<button class="text-btn" data-snack-action style="color:#a8c7fa">${esc(action.label)}</button>` : ''}<button class="icon-btn sm" data-snack-close title="Dismiss" style="color:#f2f2f2"><span class="ms">close</span></button>`;
@@ -2218,14 +2364,14 @@ function openShortcuts() {
 
 // ---------- quick settings (gear icon, like Gmail's) ----------
 
-const QS_CHOICES = {
+const QS_CHOICES: Record<string, [string, [string, string, string][]]> = {
   theme: ['Theme', [['system', 'System default', 'brightness_auto'], ['light', 'Light', 'light_mode'], ['dark', 'Dark', 'dark_mode']]],
   density: ['Density', [['default', 'Default', 'density_large'], ['comfortable', 'Comfortable', 'density_medium'], ['compact', 'Compact', 'density_small']]],
   inboxType: ['Inbox type', [['default', 'Default', 'inbox'], ['important', 'Important first', 'label_important'], ['unread', 'Unread first', 'mark_email_unread'], ['starred', 'Starred first', 'star']]],
   readingPane: ['Reading pane', [['none', 'No split', 'view_agenda'], ['right', 'Right of inbox', 'vertical_split'], ['below', 'Below inbox', 'horizontal_split']]],
 };
 
-const QS_TOGGLES = [
+const QS_TOGGLES: [keyof Inbox.Settings, string, string][] = [
   ['threading', 'Conversation view', 'Group replies into one row'],
   ['notifications', 'Desktop notifications', 'Windows alerts when new mail arrives'],
   ['unreadBadge', 'Unread count on the taskbar', ''],
@@ -2242,7 +2388,7 @@ function renderQuickSettings() {
   const choices = Object.entries(QS_CHOICES)
     .map(([key, [title, options]]) => `<div class="qs-section"><h3>${title}</h3>${options
       .map(([value, label, icon]) => `<label class="qs-option">
-        <input type="radio" name="qs-${key}" data-setting="${key}" value="${value}" ${s[key] === value ? 'checked' : ''}>
+        <input type="radio" name="qs-${key}" data-setting="${key}" value="${value}" ${s[key as keyof Inbox.Settings] === value ? 'checked' : ''}>
         <span class="grow">${label}</span><span class="qs-thumb"><span class="ms">${icon}</span></span></label>`)
       .join('')}</div>`)
     .join('');
@@ -2278,10 +2424,11 @@ function openTrackerSetup() {
     </form>
     <div class="modal-foot">${t.configured ? '<button class="btn plain" data-tracker-off>Turn off</button>' : ''}
       <button class="btn plain" data-close>Cancel</button><button class="btn primary" data-tracker-save>Save</button></div>`);
-  const form = modal.querySelector('#tracker-form');
-  const errorBox = form.querySelector('.form-error');
-  const save = async (config) => {
-    const btn = modal.querySelector('[data-tracker-save]');
+  const form = $<HTMLFormElement>('#tracker-form', modal);
+  const field = (n: string) => form.elements.namedItem(n) as HTMLInputElement;
+  const errorBox = $('.form-error', form);
+  const save = async (config: { url: string; secret: string }) => {
+    const btn = $<HTMLButtonElement>('[data-tracker-save]', modal);
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>Checking…';
     errorBox.hidden = true;
@@ -2296,33 +2443,33 @@ function openTrackerSetup() {
         if (toggle) toggle.outerHTML = trackToggleHtml(state.compose);
       }
     } catch (err) {
-      errorBox.textContent = err.message;
+      errorBox.textContent = (err as Error).message;
       errorBox.hidden = false;
       btn.disabled = false;
       btn.textContent = 'Save';
     }
   };
-  modal.querySelector('[data-tracker-save]').addEventListener('click', () =>
-    save({ url: form.elements.url.value.trim(), secret: form.elements.secret.value })
+  $('[data-tracker-save]', modal).addEventListener('click', () =>
+    save({ url: field('url').value.trim(), secret: field('secret').value })
   );
   modal.querySelector('[data-tracker-off]')?.addEventListener('click', () => save({ url: '', secret: '' }));
   form.addEventListener('submit', (e) => e.preventDefault());
-  form.elements.url.focus();
+  field('url').focus();
 }
 
-async function changeSetting(key, value) {
+async function changeSetting<K extends keyof Inbox.Settings>(key: K, value: Inbox.Settings[K]): Promise<void> {
   const prev = state.settings;
   state.settings = { ...prev, [key]: value };
   applySettings(prev);
   try {
     state.settings = await api.setSettings({ [key]: value });
   } catch (err) {
-    snack(err.message);
+    snack((err as Error).message);
   }
 }
 
 // Applies settings to the page; `prev` (when given) is used to reload only what changed.
-function applySettings(prev) {
+function applySettings(prev?: Inbox.Settings): void {
   const s = state.settings;
   document.body.classList.remove('density-default', 'density-comfortable', 'density-compact');
   document.body.classList.add(`density-${s.density}`);
@@ -2344,23 +2491,23 @@ function applySettings(prev) {
 // ---------- account management ----------
 
 // Drag a row to change the account order; it's saved when the row is dropped.
-function bindAccountDrag(list) {
+function bindAccountDrag(list: HTMLElement): void {
   list.addEventListener('pointerdown', (e) => {
-    const row = e.target.closest('[data-acct]');
-    if (!row || e.button !== 0 || e.target.closest('button, label')) return;
+    const row = (e.target as HTMLElement).closest('[data-acct]');
+    if (!row || e.button !== 0 || (e.target as HTMLElement).closest('button, label')) return;
     const startY = e.clientY;
     const grab = startY - row.getBoundingClientRect().top;
     let dragging = false;
     row.setPointerCapture(e.pointerId);
-    const mid = (el) => el.offsetTop + el.offsetHeight / 2;
+    const mid = (el: HTMLElement) => el.offsetTop + el.offsetHeight / 2;
     // Slides a neighbour to the other side of the dragged row. The neighbour is
     // what moves in the DOM: moving the row itself would drop the pointer capture.
-    const pass = (sib, side) => {
+    const pass = (sib: HTMLElement, side: 'before' | 'after') => {
       const from = sib.offsetTop;
       row[side](sib);
       sib.animate({ transform: [`translateY(${from - sib.offsetTop}px)`, 'none'] }, { duration: 120, easing: 'ease-out' });
     };
-    const move = (ev) => {
+    const move = (ev: PointerEvent) => {
       if (!dragging) {
         if (Math.abs(ev.clientY - startY) < 4) return;
         dragging = true;
@@ -2370,8 +2517,8 @@ function bindAccountDrag(list) {
       const top = Math.min(Math.max(ev.clientY - grab - list.getBoundingClientRect().top, 0), list.offsetHeight - row.offsetHeight);
       const bottom = top + row.offsetHeight;
       // Swap when the row's leading edge crosses the middle of a neighbour.
-      while (row.nextElementSibling && bottom > mid(row.nextElementSibling)) pass(row.nextElementSibling, 'before');
-      while (row.previousElementSibling && top < mid(row.previousElementSibling)) pass(row.previousElementSibling, 'after');
+      while (row.nextElementSibling && bottom > mid(row.nextElementSibling as HTMLElement)) pass(row.nextElementSibling as HTMLElement, 'before');
+      while (row.previousElementSibling && top < mid(row.previousElementSibling as HTMLElement)) pass(row.previousElementSibling as HTMLElement, 'after');
       row.style.transform = `translateY(${top - row.offsetTop}px)`;
     };
     const up = () => {
@@ -2382,12 +2529,12 @@ function bindAccountDrag(list) {
       row.classList.remove('dragging');
       row.style.transform = '';
       document.body.classList.remove('resizing', 'resize-grab');
-      const ids = $$('[data-acct]', list).map((r) => r.dataset.acct);
+      const ids = $$('[data-acct]', list).map((r) => r.dataset.acct!);
       if (ids.join() === state.accounts.map((a) => a.id).join()) return;
-      state.accounts = ids.map(accountById);
+      state.accounts = ids.map(accountById) as Inbox.PublicAccount[];
       render();
       paintAvatars();
-      api.reorderAccounts({ ids }).catch((err) => snack(err.message));
+      api.reorderAccounts({ ids }).catch((err) => snack((err as Error).message));
     };
     row.addEventListener('pointermove', move);
     row.addEventListener('pointerup', up);
@@ -2395,7 +2542,7 @@ function bindAccountDrag(list) {
   });
 }
 
-async function toggleAccountNotify(a) {
+async function toggleAccountNotify(a: Inbox.PublicAccount): Promise<unknown> {
   if (!state.settings.notifications) return snack('Desktop notifications are off. Turn them on in Quick settings.');
   a.notify = a.notify === false;
   renderSidebar();
@@ -2407,7 +2554,7 @@ async function toggleAccountNotify(a) {
     a.notify = !a.notify;
     renderSidebar();
     updateBadge();
-    snack(err.message);
+    snack((err as Error).message);
   }
 }
 
@@ -2433,14 +2580,14 @@ function openAccountsModal() {
       <div class="acct-list">${rows}</div>
     </div>
     <div class="modal-foot"><button class="btn primary" data-add><span class="ms">add</span>Add account</button></div>`);
-  bindAccountDrag(modal.querySelector('.acct-list'));
+  bindAccountDrag($('.acct-list', modal));
   modal.addEventListener('click', async (e) => {
-    if (e.target.closest('[data-add]')) openAccountForm();
-    const edit = e.target.closest('[data-edit]');
+    if ((e.target as HTMLElement).closest('[data-add]')) openAccountForm();
+    const edit = (e.target as HTMLElement).closest('[data-edit]');
     if (edit) openAccountForm(accountById(edit.dataset.edit));
-    const remove = e.target.closest('[data-remove]');
+    const remove = (e.target as HTMLElement).closest('[data-remove]');
     if (remove) {
-      const a = accountById(remove.dataset.remove);
+      const a = accountById(remove.dataset.remove)!;
       const ok = await confirmDialog(`Remove ${a.label}?`, `${a.email} will be removed from Unified Inbox. Your mail stays on the server.`, 'Remove', true);
       if (!ok) return openAccountsModal();
       try {
@@ -2448,19 +2595,19 @@ function openAccountsModal() {
         snack(`${a.email} removed.`);
         await reloadState();
       } catch (err) {
-        snack(err.message);
+        snack((err as Error).message);
       }
       openAccountsModal();
     }
   });
 }
 
-function openAccountForm(account) {
+function openAccountForm(account?: Inbox.PublicAccount | null): void {
   if (account?.demo) account = null;
   const editing = !!account;
   const providers = state.providers;
   const usedColors = new Set(state.accounts.filter((a) => !a.demo).map((a) => a.color));
-  const f = account || {
+  const f = (account as EditableAccount | null | undefined) || {
     provider: 'gmail',
     email: '',
     label: '',
@@ -2501,22 +2648,22 @@ function openAccountForm(account) {
     </form>
     <div class="modal-foot"><button class="btn plain" data-close>Cancel</button><button class="btn primary" data-submit>${editing ? 'Save' : 'Connect'}</button></div>`);
 
-  const form = modal.querySelector('#acct-form');
-  const el = (n) => form.elements[n];
-  const errorBox = form.querySelector('.form-error');
+  const form = $<HTMLFormElement>('#acct-form', modal);
+  const el = (n: string) => form.elements.namedItem(n) as HTMLInputElement;
+  const errorBox = $('.form-error', form);
 
-  function applyProvider(key, fillServers) {
+  function applyProvider(key: string, fillServers: boolean) {
     const p = providers[key];
-    form.querySelector('#pw-hint').innerHTML = `${esc(p.helpText)}${p.help ? ` <a data-link="${esc(p.help)}">Open ${esc(p.label)} security settings</a>` : ''}`;
+    $('#pw-hint', form).innerHTML = `${esc(p.helpText)}${p.help ? ` <a data-link="${esc(p.help)}">Open ${esc(p.label)} security settings</a>` : ''}`;
     if (fillServers) {
       el('imapHost').value = p.imap.host;
-      el('imapPort').value = p.imap.port;
+      el('imapPort').value = String(p.imap.port);
       el('imapSecure').checked = p.imap.secure;
       el('smtpHost').value = p.smtp.host;
-      el('smtpPort').value = p.smtp.port;
+      el('smtpPort').value = String(p.smtp.port);
       el('smtpSecure').checked = p.smtp.secure;
     }
-    if (key === 'custom') form.querySelector('details').open = true;
+    if (key === 'custom') $<HTMLDetailsElement>('details', form).open = true;
   }
   applyProvider(f.provider, false);
 
@@ -2533,18 +2680,18 @@ function openAccountForm(account) {
     }
   });
   modal.addEventListener('click', (e) => {
-    const sw = e.target.closest('[data-color]');
+    const sw = (e.target as HTMLElement).closest('[data-color]');
     if (sw) {
-      color = sw.dataset.color;
+      color = sw.dataset.color!;
       $$('.swatch', modal).forEach((s) => s.classList.toggle('on', s === sw));
     }
-    const link = e.target.closest('[data-link]');
-    if (link) api.openExternal(link.dataset.link);
+    const link = (e.target as HTMLElement).closest('[data-link]');
+    if (link) api.openExternal(link.dataset.link!);
   });
 
   async function submit() {
     errorBox.hidden = true;
-    const payload = {
+    const payload: Inbox.AccountForm = {
       provider: el('provider').value,
       email: el('email').value.trim(),
       pass: el('pass').value,
@@ -2555,8 +2702,8 @@ function openAccountForm(account) {
       imap: { host: el('imapHost').value.trim(), port: Number(el('imapPort').value), secure: el('imapSecure').checked },
       smtp: { host: el('smtpHost').value.trim(), port: Number(el('smtpPort').value), secure: el('smtpSecure').checked },
     };
-    if (editing) payload.id = account.id;
-    const btn = modal.querySelector('[data-submit]');
+    if (editing) payload.id = account!.id;
+    const btn = $<HTMLButtonElement>('[data-submit]', modal);
     btn.disabled = true;
     btn.innerHTML = `<span class="spinner"></span>${editing ? 'Saving…' : 'Connecting…'}`;
     try {
@@ -2565,13 +2712,13 @@ function openAccountForm(account) {
       snack(editing ? 'Account updated.' : `Connected ${saved.email}.`);
       await reloadState();
     } catch (err) {
-      errorBox.textContent = err.message;
+      errorBox.textContent = (err as Error).message;
       errorBox.hidden = false;
       btn.disabled = false;
       btn.textContent = editing ? 'Save' : 'Connect';
     }
   }
-  modal.querySelector('[data-submit]').addEventListener('click', submit);
+  $('[data-submit]', modal).addEventListener('click', submit);
   form.addEventListener('submit', (e) => {
     e.preventDefault();
     submit();
@@ -2581,7 +2728,7 @@ function openAccountForm(account) {
 
 // ---------- sidebar and pane sizes ----------
 
-function setSidebarCollapsed(collapsed) {
+function setSidebarCollapsed(collapsed: boolean): void {
   $('#sidebar').classList.toggle('collapsed', collapsed);
   $('#sidebar').classList.remove('peek');
   $('#menu-btn').title = collapsed ? 'Expand menu' : 'Collapse menu';
@@ -2606,7 +2753,7 @@ function bindPaneResizer() {
     document.body.classList.add('resizing', mode === 'right' ? 'resize-col' : 'resize-row');
     const main = $('#main').getBoundingClientRect();
     const list = $('#pane-list');
-    const move = (ev) => {
+    const move = (ev: PointerEvent) => {
       const size =
         mode === 'right'
           ? Math.min(Math.max(ev.clientX - main.left, 300), main.width - 320)
@@ -2637,7 +2784,7 @@ function bindEvents() {
 
   $('#menu-btn').addEventListener('click', () => setSidebarCollapsed(!$('#sidebar').classList.contains('collapsed')));
   // Collapsed sidebar: hovering slides the full menu out over the content (like Gmail).
-  let peekTimer;
+  let peekTimer: ReturnType<typeof setTimeout> | undefined;
   $('#sidebar-panel').addEventListener('mouseenter', () => {
     if (!$('#sidebar').classList.contains('collapsed')) return;
     peekTimer = setTimeout(() => $('#sidebar').classList.add('peek'), 250);
@@ -2653,22 +2800,22 @@ function bindEvents() {
     renderQuickSettings();
   });
   $('#qs-inner').addEventListener('click', (e) => {
-    if (e.target.closest('[data-qs-close]')) {
+    if ((e.target as HTMLElement).closest('[data-qs-close]')) {
       state.qsOpen = false;
       renderQuickSettings();
     }
-    if (e.target.closest('[data-qs-accounts]')) openAccountsModal();
-    if (e.target.closest('[data-qs-tracker]')) openTrackerSetup();
-    if (e.target.closest('[data-qs-test]')) {
+    if ((e.target as HTMLElement).closest('[data-qs-accounts]')) openAccountsModal();
+    if ((e.target as HTMLElement).closest('[data-qs-tracker]')) openTrackerSetup();
+    if ((e.target as HTMLElement).closest('[data-qs-test]')) {
       api.testNotification()
         .then((ok) => snack(ok ? 'Test notification sent. Check the bottom-right of your screen.' : 'Notifications are not supported on this system.'))
         .catch((err) => snack(err.message));
     }
   });
   $('#qs-inner').addEventListener('change', (e) => {
-    const input = e.target.closest('[data-setting]');
+    const input = (e.target as HTMLElement).closest<HTMLInputElement>('[data-setting]');
     if (!input) return;
-    changeSetting(input.dataset.setting, input.type === 'checkbox' ? input.checked : input.value);
+    changeSetting(input.dataset.setting as keyof Inbox.Settings, (input.type === 'checkbox' ? input.checked : input.value) as Inbox.Settings[keyof Inbox.Settings]);
   });
   $('#help-btn').addEventListener('click', openShortcuts);
   // Email bodies are themed when they're drawn, so redraw them when the theme flips.
@@ -2705,7 +2852,7 @@ function bindEvents() {
 
   $('#search-form').addEventListener('submit', (e) => {
     e.preventDefault();
-    const q = $('#search-input').value.trim();
+    const q = $<HTMLInputElement>('#search-input').value.trim();
     if (q && !state.route.q) state.accountBeforeSearch = state.route.account;
     go({ q, page: 1, open: null, ...(q ? { account: searchAccountId() } : {}) });
     $('#search-input').blur();
@@ -2713,34 +2860,34 @@ function bindEvents() {
   $('#search-account').addEventListener('click', (e) => {
     if ($('#popover-root .menu')) return closePopover();
     const current = searchAccountId();
-    openMenu(e.currentTarget, [
+    openMenu(e.currentTarget as HTMLElement, [
       { heading: 'Search in' },
       ...state.accounts.map((a) => ({ label: a.email, checked: a.id === current, run: () => pickSearchAccount(a.id) })),
     ]);
   });
   $('#search-input').addEventListener('input', () => {
-    $('#search-form').classList.toggle('has-text', !!$('#search-input').value);
+    $('#search-form').classList.toggle('has-text', !!$<HTMLInputElement>('#search-input').value);
   });
   $('#search-clear').addEventListener('click', () => {
-    $('#search-input').value = '';
+    $<HTMLInputElement>('#search-input').value = '';
     $('#search-form').classList.remove('has-text');
     if (state.route.q) go({ q: '', page: 1, open: null });
   });
 
   $('#sidebar').addEventListener('click', (e) => {
-    const bell = e.target.closest('[data-notify-account]');
+    const bell = (e.target as HTMLElement).closest('[data-notify-account]');
     if (bell) {
       e.preventDefault();
       e.stopPropagation();
-      return toggleAccountNotify(accountById(bell.dataset.notifyAccount));
+      return toggleAccountNotify(accountById(bell.dataset.notifyAccount)!);
     }
-    const folder = e.target.closest('[data-folder]');
+    const folder = (e.target as HTMLElement).closest('[data-folder]');
     if (folder) return go({ folder: folder.dataset.folder, page: 1, q: '', open: null });
-    if (e.target.closest('[data-more]')) {
+    if ((e.target as HTMLElement).closest('[data-more]')) {
       state.moreOpen = !state.moreOpen;
       return renderSidebar();
     }
-    const acc = e.target.closest('[data-account]');
+    const acc = (e.target as HTMLElement).closest('[data-account]');
     if (acc) {
       const id = acc.dataset.account;
       // Switching accounts keeps the folder you're in (Spam stays Spam).
@@ -2750,9 +2897,9 @@ function bindEvents() {
 
   const main = $('#main');
   main.addEventListener('click', (e) => {
-    const t = e.target;
-    const btn = (sel) => t.closest(sel);
-    let b;
+    const t = e.target as HTMLInputElement;
+    const btn = (sel: string) => t.closest<HTMLElement & { disabled?: boolean }>(sel);
+    let b: (HTMLElement & { disabled?: boolean }) | null;
 
     // Checkboxes: the click has already toggled .checked; shift-click selects a range.
     if (t.id === 'select-all') return selectWhere(() => t.checked);
@@ -2760,16 +2907,16 @@ function bindEvents() {
     if (btn('[data-clear-selection]')) return selectWhere(() => false);
     if (t.matches('[data-select]')) {
       state.bulk = null;
-      const row = t.closest('.row');
+      const row = t.closest('.row')!;
       const idx = Number(row.dataset.idx);
       const threads = threadsOf();
       if (e.shiftKey && state.lastSelectIdx >= 0) {
         const [lo, hi] = [Math.min(idx, state.lastSelectIdx), Math.max(idx, state.lastSelectIdx)];
         for (let i = lo; i <= hi; i++) t.checked ? state.selected.add(threads[i].key) : state.selected.delete(threads[i].key);
       } else if (t.checked) {
-        state.selected.add(row.dataset.key);
+        state.selected.add(row.dataset.key!);
       } else {
-        state.selected.delete(row.dataset.key);
+        state.selected.delete(row.dataset.key!);
       }
       state.lastSelectIdx = idx;
       return render();
@@ -2780,30 +2927,30 @@ function bindEvents() {
     if ((b = btn('[data-menu]'))) return openContextMenu(b);
     if (btn('.section-pager')) return; // the range text in a section header doesn't fold it
     if ((b = btn('[data-section]'))) {
-      const id = b.dataset.section;
+      const id = b.dataset.section!;
       state.collapsedSections.has(id) ? state.collapsedSections.delete(id) : state.collapsedSections.add(id);
       return renderListPane();
     }
     if (btn('[data-refresh]')) return loadList({ fresh: true }).then(refreshCounts);
-    if ((b = btn('[data-act]'))) return doAction(b.dataset.act, selectedKeys());
+    if ((b = btn('[data-act]'))) return doAction(b.dataset.act as Inbox.Action, selectedKeys());
     if (btn('[data-add-account]')) return openAccountForm();
     if ((b = btn('[data-edit-account]'))) return openAccountForm(accountById(b.dataset.editAccount));
 
     // conversation view; card-level buttons act on their own message
-    const mkey = btn('.msg-card')?.dataset.mkey;
+    const mkey = btn('.msg-card')?.dataset.mkey as string; // (used only by buttons inside a card)
     if (btn('[data-back]')) return go({ open: null });
     if ((b = btn('[data-step]')) && !b.disabled) return stepMessage(Number(b.dataset.step));
-    if ((b = btn('[data-msg-act]'))) return doAction(b.dataset.msgAct, [state.route.open]);
+    if ((b = btn('[data-msg-act]'))) return doAction(b.dataset.msgAct as Inbox.Action, [state.route.open]);
     if (btn('[data-show-all]')) {
-      state.thread.showAll = true;
-      state.thread.version++;
+      state.thread!.showAll = true;
+      state.thread!.version++;
       return render();
     }
     if ((b = btn('[data-quote-toggle]'))) {
       const f = state.thread?.full.get(mkey);
       if (!f) return;
       f.showQuotes = !f.showQuotes;
-      $('.msg-body iframe', btn('.msg-card')).contentDocument?.body.classList.toggle('ui-show-quotes', f.showQuotes);
+      $<HTMLIFrameElement>('.msg-body iframe', btn('.msg-card')!).contentDocument?.body.classList.toggle('ui-show-quotes', f.showQuotes);
       b.title = f.showQuotes ? 'Hide expanded content' : 'Show trimmed content';
       return;
     }
@@ -2821,7 +2968,7 @@ function bindEvents() {
     if (btn('[data-reply]')) return startReply('reply', mkey);
     if (btn('[data-forward]')) return startReply('forward', mkey);
     if (btn('[data-toggle-details]')) {
-      const d = $('.msg-details', btn('.msg-card'));
+      const d = $('.msg-details', btn('.msg-card')!);
       d.hidden = !d.hidden;
       return;
     }
@@ -2829,7 +2976,7 @@ function bindEvents() {
       const ref = parseKey(mkey);
       return api.saveAttachment({ account: ref.accountId, folder: ref.folder, uid: ref.uid, idx: Number(b.dataset.att) })
         .then((path) => path && snack(`Saved to ${path}`))
-        .catch((err) => snack(err.message));
+        .catch((err) => snack((err as Error).message));
     }
     // Clicking a collapsed message (or the header of an expanded one) toggles
     // it, unless the click ended a text selection (selecting to copy).
@@ -2838,16 +2985,16 @@ function bindEvents() {
     // rows
     const row = btn('.row');
     if (!row) return;
-    if ((b = btn('[data-row-act]'))) return doAction(b.dataset.rowAct, [row.dataset.key]);
-    if (btn('[data-star]')) return toggleStar(row.dataset.key);
-    if (btn('[data-imp]')) return toggleImportant(row.dataset.key);
+    if ((b = btn('[data-row-act]'))) return doAction(b.dataset.rowAct as Inbox.Action, [row.dataset.key!]);
+    if (btn('[data-star]')) return toggleStar(row.dataset.key!);
+    if (btn('[data-imp]')) return toggleImportant(row.dataset.key!);
     if (btn('.row-ctrl')) return;
-    state.focusKey = row.dataset.key;
+    state.focusKey = row.dataset.key!;
     go({ open: row.dataset.key });
   });
 
   $('#compose-root').addEventListener('click', (e) => {
-    const t = e.target;
+    const t = e.target as HTMLInputElement;
     const root = $('.compose');
     if (!root) return;
     if (t.closest('[data-c-close]') || t.closest('[data-c-discard]')) {
@@ -2866,29 +3013,29 @@ function bindEvents() {
     if (t.closest('[data-c-toggle]') && !t.closest('button')) return root.classList.toggle('min');
     if (t.closest('[data-c-cc]')) {
       $$('.cfield.hidden', root).forEach((f) => f.classList.remove('hidden'));
-      t.closest('[data-c-cc]').remove();
+      t.closest('[data-c-cc]')!.remove();
       $('[name=cc]', root).focus();
       return;
     }
     if (t.closest('[data-c-send]')) return sendCompose();
     if (t.closest('[data-c-track]')) {
       if (!state.tracking.configured) return openTrackerSetup();
-      state.compose.track = !state.compose.track;
-      t.closest('[data-c-track]').outerHTML = trackToggleHtml(state.compose);
+      state.compose!.track = !state.compose!.track;
+      t.closest('[data-c-track]')!.outerHTML = trackToggleHtml(state.compose!);
       return;
     }
     if (t.closest('[data-c-attach]')) return $('[data-c-file]', root).click();
     const rm = t.closest('[data-c-remove-file]');
     if (rm) {
-      state.compose.files.splice(Number(rm.dataset.cRemoveFile), 1);
+      state.compose!.files.splice(Number(rm.dataset.cRemoveFile), 1);
       renderComposeFiles();
       return;
     }
     // Recipient chips: × removes one; clicking the empty part of the box starts typing.
     const chipX = t.closest('[data-c-chip-remove]');
     if (chipX) {
-      const [field, i] = chipX.dataset.cChipRemove.split(':');
-      state.compose.chips[field].splice(Number(i), 1);
+      const [field, i] = chipX.dataset.cChipRemove!.split(':') as [RcptField, string];
+      state.compose!.chips[field].splice(Number(i), 1);
       renderChips(field);
       return;
     }
@@ -2906,52 +3053,52 @@ function bindEvents() {
     if (t.matches('[data-c-scroll]')) $('textarea', root).focus();
   });
   $('#compose-root').addEventListener('change', (e) => {
-    if (!e.target.matches('[data-c-file]')) return;
-    const files = [...e.target.files];
-    e.target.value = '';
+    if (!(e.target as HTMLElement).matches('[data-c-file]')) return;
+    const files = [...(e.target as HTMLInputElement).files!];
+    (e.target as HTMLInputElement).value = '';
     addComposeFiles(files);
   });
   // Drag files onto the compose window to attach them. Anywhere else, a dropped
   // file is ignored (instead of the window navigating to it).
-  const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+  const hasFiles = (e: DragEvent) => [...(e.dataTransfer?.types || [])].includes('Files');
   let dragDepth = 0;
-  const setDropping = (on) => $('.compose')?.classList.toggle('dropping', on);
+  const setDropping = (on: boolean) => $('.compose')?.classList.toggle('dropping', on);
   document.addEventListener('dragover', (e) => {
     if (!hasFiles(e)) return;
     e.preventDefault();
-    e.dataTransfer.dropEffect = e.target.closest?.('.compose') ? 'copy' : 'none';
+    e.dataTransfer!.dropEffect = (e.target as HTMLElement).closest?.('.compose') ? 'copy' : 'none';
   });
   document.addEventListener('drop', (e) => {
     if (!hasFiles(e)) return;
     e.preventDefault();
     dragDepth = 0;
     setDropping(false);
-    if (state.compose && e.target.closest?.('.compose')) addComposeFiles([...e.dataTransfer.files]);
+    if (state.compose && (e.target as HTMLElement).closest?.('.compose')) addComposeFiles([...e.dataTransfer!.files]);
   });
   $('#compose-root').addEventListener('dragenter', (e) => {
-    if (!hasFiles(e) || !e.target.closest('.compose')) return;
+    if (!hasFiles(e) || !(e.target as HTMLElement).closest('.compose')) return;
     dragDepth++;
     setDropping(true);
   });
   $('#compose-root').addEventListener('dragleave', (e) => {
-    if (!hasFiles(e) || !e.target.closest('.compose')) return;
+    if (!hasFiles(e) || !(e.target as HTMLElement).closest('.compose')) return;
     if (--dragDepth <= 0) {
       dragDepth = 0;
       setDropping(false);
     }
   });
   $('#compose-root').addEventListener('input', (e) => {
-    if (e.target.name === 'subject') $('.compose .title').textContent = e.target.value || 'New Message';
-    const field = e.target.closest?.('.rcpt-box')?.dataset.field;
+    if ((e.target as HTMLInputElement).name === 'subject') $('.compose .title').textContent = (e.target as HTMLInputElement).value || 'New Message';
+    const field = (e.target as HTMLElement).closest?.('.rcpt-box')?.dataset.field as RcptField | undefined;
     if (field) {
       // A space after a complete address, like a comma, finishes it (and pasted lists split on commas).
-      const v = e.target.value;
-      if (/\s$/.test(v) && looksLikeAddress(parseAddress(v.trim()))) e.target.value = `${v.trim()},`;
+      const v = (e.target as HTMLInputElement).value;
+      if (/\s$/.test(v) && looksLikeAddress(parseAddress(v.trim()))) (e.target as HTMLInputElement).value = `${v.trim()},`;
       commitRecipients(field, false);
     }
   });
   $('#compose-root').addEventListener('focusout', (e) => {
-    const field = e.target.closest?.('.rcpt-box')?.dataset.field;
+    const field = (e.target as HTMLElement).closest?.('.rcpt-box')?.dataset.field as RcptField | undefined;
     if (field) commitRecipients(field, true);
   });
   $('#compose-root').addEventListener('keydown', (e) => {
@@ -2960,22 +3107,22 @@ function bindEvents() {
       sendCompose();
       return;
     }
-    const box = e.target.closest?.('.rcpt-box');
+    const box = (e.target as HTMLElement).closest?.('.rcpt-box');
     if (!box) return;
-    const field = box.dataset.field;
+    const field = box.dataset.field as RcptField;
     if (e.key === 'Enter' || e.key === ',' || e.key === ';') {
-      if (e.target.value.trim()) {
+      if ((e.target as HTMLInputElement).value.trim()) {
         e.preventDefault();
         commitRecipients(field, true);
       } else if (e.key === 'Enter') e.preventDefault();
-    } else if (e.key === 'Backspace' && !e.target.value && state.compose.chips[field].length) {
-      state.compose.chips[field].pop();
+    } else if (e.key === 'Backspace' && !(e.target as HTMLInputElement).value && state.compose!.chips[field].length) {
+      state.compose!.chips[field].pop();
       renderChips(field);
     }
   });
 
   $('#popover-root').addEventListener('click', (e) => {
-    const t = e.target;
+    const t = e.target as HTMLInputElement;
     if (t.closest('[data-am-manage]')) {
       closePopover();
       return openAccountsModal();
@@ -2986,7 +3133,7 @@ function bindEvents() {
     }
     const copy = t.closest('[data-am-copy]');
     if (copy) {
-      copyText(copy.dataset.amCopy, 'Email address copied.');
+      copyText(copy.dataset.amCopy!, 'Email address copied.');
       return;
     }
     const acc = t.closest('[data-am-account]');
@@ -2996,11 +3143,11 @@ function bindEvents() {
     }
   });
   document.addEventListener('mousedown', (e) => {
-    if (!e.target.closest('#popover-root') && !e.target.closest('[data-menu]') && !e.target.closest('#avatar-btn')) closePopover();
+    if (!(e.target as HTMLElement).closest('#popover-root') && !(e.target as HTMLElement).closest('[data-menu]') && !(e.target as HTMLElement).closest('#avatar-btn')) closePopover();
   });
   $('#snackbar').addEventListener('click', (e) => {
-    if (e.target.closest('[data-snack-close]')) $('#snackbar').classList.remove('show');
-    if (e.target.closest('[data-snack-action]')) {
+    if ((e.target as HTMLElement).closest('[data-snack-close]')) $('#snackbar').classList.remove('show');
+    if ((e.target as HTMLElement).closest('[data-snack-action]')) {
       const run = snackAction?.run;
       $('#snackbar').classList.remove('show');
       run?.();
@@ -3024,7 +3171,7 @@ function bindEvents() {
   });
 }
 
-function openContextMenu(anchor) {
+function openContextMenu(anchor: HTMLElement): void {
   const kind = anchor.dataset.menu;
   if (kind === 'select') {
     return openMenu(anchor, [
@@ -3041,10 +3188,10 @@ function openContextMenu(anchor) {
     const s = state.list?.sections?.[0];
     const size = state.settings.sectionSize;
     return openMenu(anchor, [
-      { label: 'Show more messages', disabled: !s?.hasMore, run: () => go({ spage: s.page + 1, open: null }) },
+      { label: 'Show more messages', disabled: !s?.hasMore, run: () => go({ spage: s!.page + 1, open: null }) },
       '-',
       { heading: 'Show up to' },
-      ...[5, 10, 25, 50].map((n) => ({
+      ...([5, 10, 25, 50] as const).map((n) => ({
         label: `${n} items`,
         checked: size === n,
         run: () => size !== n && changeSetting('sectionSize', n),
@@ -3086,13 +3233,13 @@ function openContextMenu(anchor) {
           if (state.thread?.members.find((x) => keyOf(x) === mkey)?.pending) return snack('This message is still being delivered.');
           const th = state.thread;
           const member = th?.members.find((x) => keyOf(x) === mkey);
-          const failed = await api.act({ action: 'trash', items: [ref] }).then(() => false, (err) => (snack(err.message), true));
+          const failed = await api.act({ action: 'trash', items: [ref as Inbox.MessageRef] }).then(() => false, (err) => (snack((err as Error).message), true));
           if (failed) return;
           if (member) {
             // Gone from the open conversation now (a refresh must not bring it back).
-            (th.gone ||= new Set()).add(identity(member));
-            th.members = th.members.filter((x) => x !== member);
-            th.version++;
+            (th!.gone ||= new Set()).add(identity(member));
+            th!.members = th!.members.filter((x) => x !== member);
+            th!.version++;
             render();
           }
           snack('Message moved to Trash.');
@@ -3106,7 +3253,7 @@ function openContextMenu(anchor) {
 
 // Gmail-style keyboard shortcuts.
 let pendingG = 0;
-function onKeyDown(e) {
+function onKeyDown(e: KeyboardEvent): void {
   if (e.key === 'Escape') {
     if ($('#popover-root').firstElementChild) return closePopover();
     if (state.qsOpen && !modalOpen()) {
@@ -3115,10 +3262,10 @@ function onKeyDown(e) {
     }
     if (modalOpen()) return closeModal();
     if (document.activeElement === $('#search-input')) return $('#search-input').blur();
-    if (state.route.open && !e.target.closest?.('.compose')) return go({ open: null });
+    if (state.route.open && !(e.target as HTMLElement).closest?.('.compose')) return go({ open: null });
     return;
   }
-  const t = e.target;
+  const t = e.target as HTMLElement;
   if (t.closest?.('input, textarea, select, [contenteditable]') || modalOpen() || e.ctrlKey || e.metaKey || e.altKey) return;
 
   if (pendingG && Date.now() - pendingG < 1500) {

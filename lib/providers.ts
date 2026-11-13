@@ -1,7 +1,7 @@
 // Server presets for common providers. All of them need an "app password"
 // (a password generated in the provider's security settings), not the normal
 // login password.
-const PROVIDERS = {
+export const PROVIDERS: Record<Inbox.ProviderId, Inbox.Provider> = {
   gmail: {
     label: 'Gmail',
     imap: { host: 'imap.gmail.com', port: 993, secure: true },
@@ -46,7 +46,7 @@ const PROVIDERS = {
   },
 };
 
-function guessProvider(email) {
+export function guessProvider(email: string): Inbox.ProviderId {
   const domain = String(email).split('@')[1]?.toLowerCase() || '';
   if (['gmail.com', 'googlemail.com'].includes(domain)) return 'gmail';
   if (domain.startsWith('yahoo.') || domain === 'ymail.com') return 'yahoo';
@@ -54,5 +54,3 @@ function guessProvider(email) {
   if (['outlook.com', 'hotmail.com', 'live.com', 'msn.com'].includes(domain)) return 'outlook';
   return 'custom';
 }
-
-module.exports = { PROVIDERS, guessProvider };

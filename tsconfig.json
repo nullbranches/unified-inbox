@@ -1,0 +1,15 @@
+{
+  // Main process, preload and lib/ (Node + Electron, CommonJS), compiled to out/.
+  // The renderer has its own config (renderer/tsconfig.json: DOM, no Node).
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "rootDir": ".",
+    "outDir": "out"
+  },
+  "include": ["main.ts", "preload.ts", "lib/**/*.ts", "types/**/*.d.ts"],
+  "exclude": ["node_modules", "out", "dist", "release"]
+}

@@ -6,16 +6,79 @@
 //   fg    - what the user is doing (opening mail, actions)
 //   bg    - syncing, previews and prefetching
 //   watch - sits in IDLE on the Inbox so new mail is pushed instantly
-const crypto = require('crypto');
-const { AsyncLocalStorage } = require('async_hooks');
-const { ImapFlow } = require('imapflow');
-const { simpleParser } = require('mailparser');
-const nodemailer = require('nodemailer');
-const MailComposer = require('nodemailer/lib/mail-composer');
-const { PROVIDERS } = require('./providers');
-const cache = require('./cache');
+import crypto from 'crypto';
+import { AsyncLocalStorage } from 'async_hooks';
+import { ImapFlow } from 'imapflow';
+import type { FetchMessageObject, FetchOptions, FetchQueryObject, MailboxObject, MessageStructureObject, SearchObject, StatusObject } from 'imapflow';
+import { simpleParser } from 'mailparser';
+import type { AddressObject } from 'mailparser';
+import nodemailer from 'nodemailer';
+import MailComposer from 'nodemailer/lib/mail-composer';
+import type Mail from 'nodemailer/lib/mailer';
+import { PROVIDERS } from './providers';
+import * as cache from './cache';
+import type { Account, AttachmentContent, FlagChanges, ListResult, MailError, MoveTarget, OutgoingMessage } from './types';
 
-const SPECIAL_USE = {
+type Lane = 'fg' | 'bg' | 'watch';
+type Folders = Record<string, string>; // role ('inbox', 'sent', ...) -> mailbox path
+
+// A logged-in connection.
+interface Entry {
+  client: ImapFlow;
+  folders: Folders;
+  gmail: boolean;
+  lastUsed: number;
+}
+
+// What a mailbox mirror remembers (see syncMirror).
+interface MirrorRow extends Flags {
+  uid: number;
+}
+interface Mirror {
+  validity: string;
+  uidNext: number;
+  exists: number;
+  modseq: string;
+  window: number;
+  rows: MirrorRow[];
+}
+
+// (as read from the server; flagsOf always fills them in, pickFlags may pass on
+// a null from a mirror row stored by an older build)
+interface Flags {
+  unread: boolean;
+  starred: boolean;
+  draft: boolean;
+  inInbox: boolean;
+  gmImportant: boolean | null;
+}
+
+type Summary = Inbox.MessageSummary;
+// The parts of a summary that never change for a UID (no flags).
+type StaticSummary = Omit<Summary, keyof Flags>;
+
+// A connection, or one still logging in.
+type Slot = Partial<Entry> & { connecting?: Promise<Entry> };
+
+// host, port -> proxy URL or null (see setProxyResolver).
+type ProxyResolver = (host: string, port: number) => Promise<string | null>;
+
+// See allMailWindow / storedThread.
+interface AllMailWindow {
+  min: number;
+  top: number;
+  uids: Set<number>;
+  byThread: Map<string, MirrorRow[]>;
+}
+interface StoredThread {
+  uids: number[];
+  upTo: number;
+}
+
+// The mailbox selected on a connection (code that calls this holds its lock).
+const selected = (client: ImapFlow) => client.mailbox as MailboxObject;
+
+const SPECIAL_USE: Record<string, string> = {
   '\\Sent': 'sent',
   '\\Drafts': 'drafts',
   '\\Junk': 'spam',
@@ -31,14 +94,15 @@ const RELATED_WINDOW = 300;
 const KEEPALIVE_MS = 4 * 60 * 1000;
 const SEARCH_TIMEOUT_MS = 60 * 1000;
 
-const clients = new Map(); // `${account id}:${lane}` -> { client, folders, gmail, lastUsed } | { connecting }
+const clients = new Map<string, Slot>(); // `${account id}:${lane}` -> { client, folders, gmail, lastUsed } | { connecting }
 
 // Code run inside inLane('bg', fn) uses the background connection.
-const laneStore = new AsyncLocalStorage();
-const inLane = (lane, fn) => laneStore.run(lane, fn);
-const currentLane = () => laneStore.getStore() || 'fg';
+const laneStore = new AsyncLocalStorage<Lane>();
+export const inLane = <T>(lane: Lane, fn: () => T): T => laneStore.run(lane, fn);
+const currentLane = (): Lane => laneStore.getStore() || 'fg';
 
-function friendlyError(err, account) {
+export function friendlyError(error: unknown, account?: { imap?: { host?: string } }): string {
+  const err = error as MailError | null | undefined;
   if (!err) return 'Unknown error';
   if (err.authenticationFailed || err.responseCode === 535 || /auth/i.test(err.code || '')) {
     return 'Login failed. Check the email address and app password.';
@@ -60,11 +124,11 @@ function friendlyError(err, account) {
 // The proxy Windows is set to use for a server ('http://…' / 'socks5://…'),
 // or null to connect directly. VPN apps such as Astrill's OpenWeb mode only
 // route traffic that goes through the system proxy. Set by main.js.
-let proxyResolver = async () => null;
-function setProxyResolver(fn) {
+let proxyResolver: ProxyResolver = async () => null;
+export function setProxyResolver(fn: ProxyResolver): void {
   proxyResolver = fn;
 }
-async function proxyFor(server) {
+async function proxyFor(server: Inbox.ServerConfig): Promise<string | null> {
   try {
     return (await proxyResolver(server.host, server.port)) || null;
   } catch {
@@ -72,7 +136,7 @@ async function proxyFor(server) {
   }
 }
 
-function newClient(account, lane = 'fg', proxy = null) {
+function newClient(account: Account, lane: Lane = 'fg', proxy: string | null = null): ImapFlow {
   const client = new ImapFlow({
     host: account.imap.host,
     port: account.imap.port,
@@ -92,42 +156,43 @@ function newClient(account, lane = 'fg', proxy = null) {
   return client;
 }
 
-async function resolveFolders(client) {
-  const folders = { inbox: 'INBOX' };
+async function resolveFolders(client: ImapFlow): Promise<Folders> {
+  const folders: Folders = { inbox: 'INBOX' };
   for (const box of await client.list()) {
-    const key = SPECIAL_USE[box.specialUse];
+    const key = box.specialUse && SPECIAL_USE[box.specialUse];
     if (key && !folders[key]) folders[key] = box.path;
   }
   return folders;
 }
 
-const folderCache = new Map(); // account id -> folders, shared by all connections
+const folderCache = new Map<string, Folders>(); // account id -> folders, shared by all connections
 
-const TIMEOUT_CODES = new Set(['ETIMEDOUT', 'CONNECT_TIMEOUT', 'GREETING_TIMEOUT']);
+const TIMEOUT_CODES = new Set<string | undefined>(['ETIMEDOUT', 'CONNECT_TIMEOUT', 'GREETING_TIMEOUT']);
 
-const isLoginError = (err) => err?.authenticationFailed || /auth/i.test(err?.code || '');
+const isLoginError = (err: MailError | undefined) => err?.authenticationFailed || /auth/i.test(err?.code || '');
 
 // A VPN often drops a single connection attempt; try once more before giving
 // up. Through the system proxy first; if that fails, directly.
-async function connect(account) {
+async function connect(account: Account): Promise<Entry> {
   const proxy = await proxyFor(account.imap);
   try {
     return await connectOnce(account, proxy);
   } catch (err) {
-    if (isLoginError(err) || (!proxy && !TIMEOUT_CODES.has(err?.code))) throw err;
+    const e = err as MailError | undefined;
+    if (isLoginError(e) || (!proxy && !TIMEOUT_CODES.has(e?.code ?? ''))) throw err;
     return connectOnce(account, null);
   }
 }
 
-async function connectOnce(account, proxy) {
+async function connectOnce(account: Account, proxy: string | null): Promise<Entry> {
   const lane = currentLane();
   const key = `${account.id}:${lane}`;
   const existing = clients.get(key);
-  if (existing?.client?.usable) return existing;
+  if (existing?.client?.usable) return existing as Entry;
   if (existing?.connecting) return existing.connecting;
 
   const client = newClient(account, lane, proxy);
-  let keepAlive;
+  let keepAlive: ReturnType<typeof setInterval> | undefined;
   client.on('close', () => {
     clearInterval(keepAlive);
     if (clients.get(key)?.client === client) clients.delete(key);
@@ -136,7 +201,7 @@ async function connectOnce(account, proxy) {
     await client.connect();
     // The folder list is remembered on disk; refresh it in the background.
     if (!folderCache.has(account.id)) {
-      const saved = cache.get('folders', account.id);
+      const saved = cache.get<Folders>('folders', account.id);
       if (saved) {
         folderCache.set(account.id, saved);
         // Later, so it doesn't hold up the first screen on this connection.
@@ -144,7 +209,7 @@ async function connectOnce(account, proxy) {
           if (!client.usable) return;
           resolveFolders(client)
             .then((fresh) => {
-              Object.assign(folderCache.get(account.id), fresh);
+              Object.assign(folderCache.get(account.id)!, fresh);
               cache.put('folders', account.id, fresh);
             })
             .catch(() => {});
@@ -155,9 +220,9 @@ async function connectOnce(account, proxy) {
         cache.put('folders', account.id, fresh);
       }
     }
-    const entry = {
+    const entry: Entry = {
       client,
-      folders: folderCache.get(account.id),
+      folders: folderCache.get(account.id)!,
       gmail: client.capabilities.has('X-GM-EXT-1'),
       lastUsed: Date.now(),
     };
@@ -184,14 +249,14 @@ async function connectOnce(account, proxy) {
 }
 
 // Logs in ahead of time so the first screen doesn't wait for it.
-function warmUp(account) {
+export function warmUp(account: Account) {
   return Promise.allSettled([connect(account), inLane('bg', () => connect(account))]);
 }
 
-function disconnect(accountId) {
+export function disconnect(accountId: string): void {
   folderCache.delete(accountId);
   watchers.delete(accountId);
-  for (const lane of ['fg', 'bg', 'watch']) {
+  for (const lane of ['fg', 'bg', 'watch'] as Lane[]) {
     const entry = clients.get(`${accountId}:${lane}`);
     clients.delete(`${accountId}:${lane}`);
     entry?.client?.logout().catch(() => {});
@@ -199,7 +264,7 @@ function disconnect(accountId) {
 }
 
 // Runs fn with a connected client, reconnecting once if the connection went stale.
-async function withClient(account, fn) {
+async function withClient<T>(account: Account, fn: (entry: Entry) => T | Promise<T>): Promise<T> {
   let entry = await connect(account);
   entry.lastUsed = Date.now();
   try {
@@ -212,7 +277,7 @@ async function withClient(account, fn) {
   }
 }
 
-async function withMailbox(account, path, fn) {
+async function withMailbox<T>(account: Account, path: string, fn: (entry: Entry) => T | Promise<T>): Promise<T> {
   return withClient(account, async (entry) => {
     const lock = await entry.client.getMailboxLock(path);
     try {
@@ -230,7 +295,7 @@ async function withMailbox(account, path, fn) {
 // the connection sees. Stage 0 asks the server for updates (NOOP), stage 1
 // selects the mailbox again, stage 2 waits a moment (the server may still be
 // indexing the message) and selects it again.
-async function refreshSelection(client, path, stage) {
+async function refreshSelection(client: ImapFlow, path: string, stage: number): Promise<void> {
   if (stage === 0) return client.noop();
   if (stage >= 2) await new Promise((resolve) => setTimeout(resolve, 800));
   await client.mailboxOpen(path);
@@ -238,7 +303,13 @@ async function refreshSelection(client, path, stage) {
 
 // fetchOne for a UID, refreshing the connection's view of the mailbox until the
 // message shows up (the lock for `path` must be held).
-async function fetchOneRefreshing(client, path, uid, query, found = (msg) => !!msg) {
+async function fetchOneRefreshing(
+  client: ImapFlow,
+  path: string,
+  uid: number,
+  query: FetchQueryObject,
+  found: (msg: FetchMessageObject | false | undefined) => boolean = (msg) => !!msg
+): Promise<FetchMessageObject | false | undefined> {
   for (let stage = -1; stage <= 2; stage++) {
     if (stage >= 0) await refreshSelection(client, path, stage);
     const msg = await client.fetchOne(String(uid), query, { uid: true });
@@ -248,27 +319,27 @@ async function fetchOneRefreshing(client, path, uid, query, found = (msg) => !!m
 }
 
 // Which mailbox role a path plays for this account ("inbox", "trash", ...).
-function roleOf(entry, path) {
+function roleOf(entry: Entry, path: string): string | null {
   if (path === 'INBOX') return 'inbox';
   for (const [role, p] of Object.entries(entry.folders)) if (p === path && role !== 'inbox') return role;
   return null;
 }
 
-function withRoles(entry, messages) {
+function withRoles(entry: Entry, messages: Summary[]): Summary[] {
   for (const m of messages) m.role = m.inInbox ? 'inbox' : roleOf(entry, m.folder);
   return messages;
 }
 
 // ---------- message summaries ----------
 
-function walkParts(node, out = []) {
+function walkParts(node: MessageStructureObject | undefined, out: MessageStructureObject[] = []): MessageStructureObject[] {
   if (!node) return out;
   if (node.childNodes) node.childNodes.forEach((c) => walkParts(c, out));
   else out.push(node);
   return out;
 }
 
-function findTextPart(structure) {
+function findTextPart(structure: MessageStructureObject | undefined): Inbox.TextPartInfo | null {
   const parts = walkParts(structure).filter((p) => p.disposition !== 'attachment');
   const pick = parts.find((p) => p.type === 'text/plain') || parts.find((p) => p.type === 'text/html');
   if (!pick) return null;
@@ -281,20 +352,20 @@ function findTextPart(structure) {
 }
 
 // Names and types of the regular (non-inline) attachments, for the chips under list rows.
-function attachmentFiles(structure) {
+function attachmentFiles(structure: MessageStructureObject | undefined): Inbox.FileChip[] {
   return walkParts(structure)
     .filter((p) => p.disposition === 'attachment' || (p.dispositionParameters?.filename && p.disposition !== 'inline'))
     .map((p) => ({ name: p.dispositionParameters?.filename || p.parameters?.name || 'attachment', type: p.type }));
 }
 
 // Message-ID style identifiers ("<abc@host>"), lowercased, from a header value.
-function parseIds(value) {
+function parseIds(value: unknown): string[] {
   return (String(value || '').match(/<[^<>\s]+>/g) || []).map((s) => s.toLowerCase());
 }
 
 // Raw header lines -> { lowercase name: unfolded value }.
-function parseHeaders(buf) {
-  const out = {};
+function parseHeaders(buf: Buffer | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
   for (const line of String(buf || '').replace(/\r?\n[ \t]+/g, ' ').split(/\r?\n/)) {
     const i = line.indexOf(':');
     if (i > 0) out[line.slice(0, i).trim().toLowerCase()] = line.slice(i + 1).trim();
@@ -305,7 +376,7 @@ function parseHeaders(buf) {
 // Headers that tell personal mail from bulk mail, for "Important first".
 const HEADERS = ['references', 'list-unsubscribe', 'list-id', 'precedence', 'auto-submitted', 'importance', 'x-priority'];
 
-function importanceHints(h) {
+function importanceHints(h: Record<string, string>) {
   return {
     bulk: !!(h['list-unsubscribe'] || h['list-id'] || /bulk|list|junk/i.test(h.precedence || '') ||
       (h['auto-submitted'] && !/^no\b/i.test(h['auto-submitted']))),
@@ -314,7 +385,7 @@ function importanceHints(h) {
 }
 
 // The parts of a summary that never change for a given UID (everything but flags).
-function staticSummary(account, path, msg) {
+function staticSummary(account: Account, path: string, msg: FetchMessageObject): StaticSummary {
   const env = msg.envelope || {};
   const files = attachmentFiles(msg.bodyStructure);
   const headers = parseHeaders(msg.headers);
@@ -323,8 +394,8 @@ function staticSummary(account, path, msg) {
     accountId: account.id,
     folder: path,
     uid: msg.uid,
-    from: env.from?.[0] || { name: '', address: '' },
-    to: env.to || [],
+    from: (env.from?.[0] || { name: '', address: '' }) as Inbox.Address,
+    to: (env.to || []) as Inbox.Address[],
     subject: env.subject || '',
     snippet: '',
     date: new Date(msg.internalDate || env.date || Date.now()).toISOString(),
@@ -340,7 +411,7 @@ function staticSummary(account, path, msg) {
   };
 }
 
-const SUMMARY_QUERY = {
+const SUMMARY_QUERY: FetchQueryObject = {
   uid: true,
   envelope: true,
   internalDate: true,
@@ -352,23 +423,23 @@ const SUMMARY_QUERY = {
 
 // Summaries are stored per mailbox ("account:path:uidvalidity:") in memory,
 // backed by the disk cache, so they are downloaded once, ever.
-const summaries = new Map();
-const loadedMailboxes = new Set();
+const summaries = new Map<string, StaticSummary | true>(); // (true under uid 0: the mailbox has been read before)
+const loadedMailboxes = new Set<string>();
 
 // Stored under "sum2" (summaries now include importance hints, so older
 // stored ones are fetched again once).
 const SUMMARY_NS = 'sum2';
 
-function summaryStore(account, path, validity) {
+function summaryStore(account: Account, path: string, validity: string | bigint) {
   const prefix = `${account.id}:${path}:${validity}:`;
   if (!loadedMailboxes.has(prefix)) {
     loadedMailboxes.add(prefix);
-    for (const [key, value] of cache.entries(SUMMARY_NS, prefix)) summaries.set(key, value);
+    for (const [key, value] of cache.entries<StaticSummary | true>(SUMMARY_NS, prefix)) summaries.set(key, value);
   }
   return {
-    has: (uid) => summaries.has(prefix + uid),
-    get: (uid) => summaries.get(prefix + uid),
-    set(uid, value) {
+    has: (uid: number) => summaries.has(prefix + uid),
+    get: (uid: number) => summaries.get(prefix + uid) as StaticSummary | undefined,
+    set(uid: number, value: StaticSummary | true) {
       summaries.set(prefix + uid, value);
       cache.put(SUMMARY_NS, prefix + uid, value);
     },
@@ -376,29 +447,29 @@ function summaryStore(account, path, validity) {
 }
 
 // Flags (and, on Gmail, labels). gmImportant is Gmail's own importance verdict.
-const flagsOf = (r) => ({
+const flagsOf = (r: FetchMessageObject): Flags => ({
   unread: !r.flags?.has('\\Seen'),
   starred: !!r.flags?.has('\\Flagged'),
   draft: !!r.flags?.has('\\Draft'),
   inInbox: !!r.labels?.has('\\Inbox'),
   gmImportant: r.labels ? r.labels.has('\\Important') : null,
 });
-const FLAG_FIELDS = ['unread', 'starred', 'draft', 'inInbox', 'gmImportant'];
-const pickFlags = (r) => Object.fromEntries(FLAG_FIELDS.map((f) => [f, r[f] ?? null]));
+const FLAG_FIELDS: (keyof Flags)[] = ['unread', 'starred', 'draft', 'inInbox', 'gmImportant'];
+const pickFlags = (r: { [K in keyof Flags]?: Flags[K] | null }): Flags => Object.fromEntries(FLAG_FIELDS.map((f) => [f, r[f] ?? null])) as unknown as Flags;
 
 // Summaries for a range (sequence set, or UIDs with byUid). Known messages only
 // get their flags fetched; a mailbox we know nothing about is fetched in one go.
 // allNew: the range holds only messages we've never seen (fetch everything at once).
-async function fetchSummaries(client, account, path, range, byUid, allNew = false) {
-  const known = summaryStore(account, path, client.mailbox.uidValidity);
+async function fetchSummaries(client: ImapFlow, account: Account, path: string, range: string, byUid: boolean, allNew = false): Promise<Summary[]> {
+  const known = summaryStore(account, path, selected(client).uidValidity);
   // Gmail labels change with archive/move-to-inbox, so they're fetched with the flags.
   const gmail = client.capabilities.has('X-GM-EXT-1');
-  const flagQuery = { uid: true, flags: true, labels: gmail };
+  const flagQuery: FetchQueryObject = { uid: true, flags: true, labels: gmail };
   const opts = byUid ? { uid: true } : undefined;
   const flagsOnly = known.has(0) && !allNew;
   const first = await client.fetchAll(range, flagsOnly ? flagQuery : { ...SUMMARY_QUERY, ...flagQuery }, opts);
-  const rows = [];
-  const missing = [];
+  const rows: FetchMessageObject[] = [];
+  const missing: FetchMessageObject[] = [];
   for (const r of first) {
     if (r.envelope) known.set(r.uid, staticSummary(account, path, r));
     if (known.has(r.uid)) rows.push(r);
@@ -412,10 +483,10 @@ async function fetchSummaries(client, account, path, range, byUid, allNew = fals
   }
   // Remember that this mailbox has been seen, so later fetches start with flags only.
   if (!known.has(0)) known.set(0, true);
-  return rows.map((r) => ({ ...known.get(r.uid), ...flagsOf(r) }));
+  return rows.map((r) => ({ ...known.get(r.uid)!, ...flagsOf(r) }));
 }
 
-async function fetchMatching(entry, account, path, count, criteria) {
+async function fetchMatching(entry: Entry, account: Account, path: string, count: number, criteria: SearchObject): Promise<ListResult> {
   const { client } = entry;
   const uids = await client.search(criteria, { uid: true });
   if (!uids) throw new Error('The mail server refused this search.'); // (not the same as no matches)
@@ -428,24 +499,24 @@ async function fetchMatching(entry, account, path, count, criteria) {
 // A mirror is the newest `window` messages of a mailbox: UIDs and flags, plus
 // the mailbox state (UIDNEXT, message count, HIGHESTMODSEQ) they were read at.
 // Bringing it up to date asks the server only what changed since then.
-const mirrors = new Map();
+const mirrors = new Map<string, Mirror>();
 
-function loadMirror(key) {
+function loadMirror(key: string): Mirror | undefined {
   if (!mirrors.has(key)) {
-    const saved = cache.get('mirror', key);
+    const saved = cache.get<Mirror>('mirror', key);
     if (saved) mirrors.set(key, saved);
   }
   return mirrors.get(key);
 }
 
-function saveMirror(key, mirror) {
+function saveMirror(key: string, mirror: Mirror): void {
   mirrors.set(key, mirror);
   cache.put('mirror', key, mirror);
 }
 
 // Takes messages that are no longer in a mailbox (moved or deleted) out of its
 // mirror, so the list stops showing them before the next sync confirms it.
-function dropFromMirror(account, path, uids) {
+function dropFromMirror(account: Account, path: string, uids: (number | string)[]): void {
   const key = `${account.id}:${path}`;
   const mirror = loadMirror(key);
   if (!mirror) return;
@@ -460,11 +531,11 @@ function dropFromMirror(account, path, uids) {
 // delete. Once a message is found to be one, the app leaves it out. (UIDs are
 // never reused within a mailbox's UIDVALIDITY, so this can't hide other mail.)
 const MAX_PHANTOMS = 200;
-const phantomKey = (account, path, validity) => `${account.id}:${path}:${validity}`;
-function phantoms(account, path, validity) {
-  return new Set(cache.get('phantom', phantomKey(account, path, validity)) || []);
+const phantomKey = (account: Account, path: string, validity: string) => `${account.id}:${path}:${validity}`;
+function phantoms(account: Account, path: string, validity: string): Set<number> {
+  return new Set(cache.get<number[]>('phantom', phantomKey(account, path, validity)) || []);
 }
-function markPhantoms(account, path, uids) {
+function markPhantoms(account: Account, path: string, uids: (number | string)[]): void {
   const mirror = loadMirror(`${account.id}:${path}`);
   if (!mirror || !uids.length) return;
   const set = phantoms(account, path, mirror.validity);
@@ -473,12 +544,12 @@ function markPhantoms(account, path, uids) {
   dropFromMirror(account, path, uids);
 }
 
-async function syncMirror(account, path, count) {
+async function syncMirror(account: Account, path: string, count: number): Promise<Mirror> {
   const key = `${account.id}:${path}`;
   const old = loadMirror(key);
   // One round trip tells us whether anything changed at all.
-  const status = await withClient(account, (e) =>
-    e.client.status(path, { messages: true, uidNext: true, uidValidity: true, highestModseq: true })
+  const status = (await withClient(account, (e) =>
+    e.client.status(path, { messages: true, uidNext: true, uidValidity: true, highestModseq: true })) as StatusObject
   );
   const sameMailbox = old && String(status.uidValidity) === old.validity;
   const ghosts = phantoms(account, path, String(status.uidValidity));
@@ -495,14 +566,14 @@ async function syncMirror(account, path, count) {
   }
 
   return withMailbox(account, path, async ({ client }) => {
-    let mb = client.mailbox; // replaced when the mailbox is selected again
+    let mb = selected(client); // replaced when the mailbox is selected again
     const validity = String(mb.uidValidity);
     // The STATUS above, run while this mailbox is selected, raises mb.uidNext
     // without telling the connection about the new messages themselves. Rows
     // that stop short of UIDNEXT may be missing the newest mail (or the newest
     // UIDs were deleted, e.g. Gmail's draft autosaves): look again after a
     // refresh, since the mirror records UIDNEXT and would skip them for good.
-    const reachesTop = (list) => list.some((s) => s.uid >= mb.uidNext - 1);
+    const reachesTop = (list: { uid: number }[]) => list.some((s) => s.uid >= mb.uidNext - 1);
     // Reads the newest `count` messages from scratch (details already stored
     // are not downloaded again, only their flags).
     const readNewest = async () => {
@@ -512,17 +583,17 @@ async function syncMirror(account, path, count) {
       // Fewer than there should be: the connection may not know about the newest mail yet.
       for (let stage = 0; (list.length < Math.min(count, mb.exists) || (mb.exists && !reachesTop(list))) && stage < 2; stage++) {
         await refreshSelection(client, path, stage);
-        mb = client.mailbox;
+        mb = selected(client);
         list = await read();
       }
       return list;
     };
-    let rows;
+    let rows: (MirrorRow | Summary)[];
     if (!sameMailbox || old.window < count || !mb.exists) {
       // Nothing usable to build on.
       rows = await readNewest();
     } else {
-      const byUid = new Map(old.rows.map((r) => [r.uid, r]));
+      const byUid = new Map<number, MirrorRow | Summary>(old.rows.map((r) => [r.uid, r]));
       const minUid = old.rows.length ? Math.min(...old.rows.map((r) => r.uid)) : 1;
       // New messages.
       let added = 0;
@@ -534,7 +605,7 @@ async function syncMirror(account, path, count) {
         // (all of it) yet: refresh what it sees and look again.
         for (let stage = 0; !reachesTop(fresh) && stage < 2; stage++) {
           await refreshSelection(client, path, stage);
-          mb = client.mailbox;
+          mb = selected(client);
           fresh = await readNew();
         }
         for (const s of fresh) {
@@ -544,7 +615,7 @@ async function syncMirror(account, path, count) {
       }
       // Flag changes: only the ones newer than our modseq (CONDSTORE), else all.
       const gmail = client.capabilities.has('X-GM-EXT-1');
-      const flagOpts = { uid: true };
+      const flagOpts: FetchOptions = { uid: true };
       if (old.modseq && mb.highestModseq != null) flagOpts.changedSince = BigInt(old.modseq);
       if (!flagOpts.changedSince || String(mb.highestModseq) !== old.modseq) {
         for (const r of await client.fetchAll(`${minUid}:*`, { uid: true, flags: true, labels: gmail }, flagOpts)) {
@@ -578,10 +649,10 @@ async function syncMirror(account, path, count) {
   });
 }
 
-const healTried = new Set(); // mirrored messages we already tried to fetch details for
+const healTried = new Set<string>(); // mirrored messages we already tried to fetch details for
 
 // The newest `count` messages of a mailbox, from the mirror.
-async function listPath(account, path, count) {
+async function listPath(account: Account, path: string, count: number): Promise<ListResult> {
   const entry = await connect(account);
   const mirror = await syncMirror(account, path, count);
   const known = summaryStore(account, path, mirror.validity);
@@ -589,7 +660,7 @@ async function listPath(account, path, count) {
   // Self-healing: a mirrored message without stored details is fetched, never
   // silently left out (otherwise the mailbox would look empty although the
   // mirror says it isn't). Tried once per message, in case it's already gone.
-  const tag = (uid) => `${account.id}:${path}:${mirror.validity}:${uid}`;
+  const tag = (uid: number) => `${account.id}:${path}:${mirror.validity}:${uid}`;
   const missing = wanted.filter((r) => !known.has(r.uid) && !healTried.has(tag(r.uid)));
   if (missing.length) {
     missing.forEach((r) => healTried.add(tag(r.uid)));
@@ -600,23 +671,23 @@ async function listPath(account, path, count) {
       }
     });
   }
-  const messages = wanted.filter((r) => known.has(r.uid)).map((r) => ({ ...known.get(r.uid), ...pickFlags(r) }));
+  const messages = wanted.filter((r) => known.has(r.uid)).map((r) => ({ ...known.get(r.uid)!, ...pickFlags(r) }));
   return { total: mirror.exists, messages: withRoles(entry, messages) };
 }
 
-async function listMatching(account, path, count, criteria) {
+async function listMatching(account: Account, path: string, count: number, criteria: SearchObject): Promise<ListResult> {
   const entry = await connect(account);
   const result = await withMailbox(account, path, (e) => fetchMatching(e, account, path, count, criteria));
   withRoles(entry, result.messages);
   return result;
 }
 
-function folderPath(entry, folderKey) {
+function folderPath(entry: Entry, folderKey: string): string | undefined {
   if (folderKey === 'all') return entry.folders.all || entry.folders.archive;
   return entry.folders[folderKey];
 }
 
-async function list(account, folderKey, count) {
+export async function list(account: Account, folderKey: string, count: number): Promise<ListResult> {
   const entry = await connect(account);
   // Providers without a Starred folder: look for flagged mail in the inbox.
   if (folderKey === 'starred' && !entry.folders.starred) return listMatching(account, 'INBOX', count, { flagged: true });
@@ -627,9 +698,9 @@ async function list(account, folderKey, count) {
 
 // Inbox messages matching a filter, for "Unread first" / "Starred first" inboxes.
 // Answered from the inbox mirror when it covers enough mail.
-async function listFiltered(account, filter, count) {
+export async function listFiltered(account: Account, filter: string, count: number): Promise<ListResult> {
   const inbox = await listPath(account, 'INBOX', Math.max(count, 100));
-  const want = (m) => (filter === 'unread' ? m.unread : m.starred);
+  const want = (m: Summary) => (filter === 'unread' ? m.unread : m.starred);
   const hits = inbox.messages.filter(want);
   if (inbox.messages.length >= inbox.total) return { total: hits.length, messages: hits.slice(0, count) };
   return listMatching(account, 'INBOX', count, filter === 'unread' ? { seen: false } : { flagged: true });
@@ -638,11 +709,11 @@ async function listFiltered(account, filter, count) {
 // Searches everywhere, including Trash and Spam (results are tagged with their role).
 // "No matches" is only reported when every folder was really searched, and a
 // server that stops answering ends in an error instead of a search that never returns.
-async function search(account, query, count) {
+export async function search(account: Account, query: string, count: number): Promise<ListResult> {
   const entry = await connect(account);
   const f = entry.folders;
   const paths = entry.gmail && f.all ? [f.all, f.trash, f.spam] : ['INBOX', f.sent, f.archive, f.trash, f.spam];
-  const criteria = entry.gmail
+  const criteria: SearchObject = entry.gmail
     ? { gmraw: query }
     : { or: [{ subject: query }, { from: query }, { to: query }, { body: query }] };
   const tooSlow = new Error(`${account.email} took too long to answer this search. Check your connection and try again.`);
@@ -668,8 +739,8 @@ async function search(account, query, count) {
     if (failure && !messages.length) throw failure;
     return { total, messages };
   })();
-  let timer;
-  const timeout = new Promise((_, reject) => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       expired = true;
       reject(tooSlow);
@@ -700,26 +771,26 @@ const THREADS_NS = 'thr2'; // ('thr' held plain UID lists that went stale)
 
 // What the mirrored window covers: every message from UID `min` up to `top`,
 // and its messages grouped by conversation (only the conversations in `ids`).
-function allMailWindow(account, path, mirror, ids) {
+function allMailWindow(account: Account, path: string, mirror: Mirror, ids: string[]): AllMailWindow {
   const known = summaryStore(account, path, mirror.validity);
   const min = mirror.rows.length >= mirror.exists ? 0 : mirror.rows.length ? Math.min(...mirror.rows.map((r) => r.uid)) : mirror.uidNext;
   const wanted = new Set(ids);
-  const byThread = new Map();
+  const byThread = new Map<string, MirrorRow[]>();
   for (const r of mirror.rows) {
     const id = known.get(r.uid)?.threadId;
-    if (!wanted.has(id)) continue;
+    if (!id || !wanted.has(id)) continue;
     if (!byThread.has(id)) byThread.set(id, []);
-    byThread.get(id).push(r);
+    byThread.get(id)!.push(r);
   }
   return { min, top: mirror.uidNext, uids: new Set(mirror.rows.map((r) => r.uid)), byThread };
 }
 
 // A window that covers nothing (the mirror is missing or out of date).
-const NO_WINDOW = { min: Infinity, top: 0, uids: new Set(), byThread: new Map() };
+const NO_WINDOW: AllMailWindow = { min: Infinity, top: 0, uids: new Set(), byThread: new Map() };
 
 // The stored members of a conversation, if they still reach the window.
-function storedThread(key, id, win, startsNew) {
-  const saved = cache.get(THREADS_NS, key);
+function storedThread(key: string, id: string, win: AllMailWindow, startsNew: Set<string>): StoredThread | null {
+  const saved = cache.get<StoredThread>(THREADS_NS, key);
   if (saved) return saved.upTo >= win.min ? saved : null;
   return startsNew.has(id) && win.min <= win.top ? { uids: [], upTo: win.min } : null;
 }
@@ -728,7 +799,7 @@ function storedThread(key, id, win, startsNew) {
 // with the flags of its messages there (for when they have left it). Returns
 // the members below the window. (A member at or above the window's start that
 // isn't in it has been deleted.)
-function keepThread(account, validity, id, saved, win) {
+function keepThread(account: Account, validity: string, id: string, saved: StoredThread, win: AllMailWindow): number[] {
   const rows = win.byThread.get(id) || [];
   for (const r of rows) {
     const k = `${account.id}:${validity}:${r.uid}`;
@@ -736,14 +807,14 @@ function keepThread(account, validity, id, saved, win) {
     if (JSON.stringify(cache.get('oflags', k)) !== JSON.stringify(flags)) cache.put('oflags', k, flags);
   }
   const older = [...new Set(saved.uids)].filter((u) => u < win.min);
-  const next = { uids: [...older, ...rows.map((r) => r.uid)].sort((a, b) => a - b), upTo: Math.max(saved.upTo, win.top) };
+  const next: StoredThread = { uids: [...older, ...rows.map((r) => r.uid)].sort((a, b) => a - b), upTo: Math.max(saved.upTo, win.top) };
   const key = `${account.id}:${validity}:${id}`;
   if (JSON.stringify(cache.get(THREADS_NS, key)) !== JSON.stringify(next)) cache.put(THREADS_NS, key, next);
   return older;
 }
 
-async function gmailThreads(account, entry, threadIds, startsNew = new Set()) {
-  const path = entry.folders.all;
+async function gmailThreads(account: Account, entry: Entry, threadIds: string[], startsNew = new Set<string>()): Promise<Summary[]> {
+  const path = entry.folders.all!;
   const ids = [...new Set(threadIds)];
   const mirror = loadMirror(`${account.id}:${path}`);
   // Usually every conversation is known and its older messages are stored:
@@ -751,39 +822,39 @@ async function gmailThreads(account, entry, threadIds, startsNew = new Set()) {
   // when they were last in the window or fetched).
   if (mirror) {
     const win = allMailWindow(account, path, mirror, ids);
-    const key = (id) => `${account.id}:${mirror.validity}:${id}`;
-    const saved = ids.map((id) => [id, storedThread(key(id), id, win, startsNew)]);
+    const key = (id: string) => `${account.id}:${mirror.validity}:${id}`;
+    const saved = ids.map((id) => [id, storedThread(key(id), id, win, startsNew)] as const);
     if (saved.every(([, s]) => s)) {
       const known = summaryStore(account, path, mirror.validity);
-      const outside = new Set(saved.flatMap(([id, s]) => keepThread(account, mirror.validity, id, s, win)));
-      const stored = [...outside].map((u) => ({ summary: known.get(u), flags: cache.get('oflags', `${account.id}:${mirror.validity}:${u}`) }));
-      if (stored.every((s) => s.summary && s.flags)) return withRoles(entry, stored.map((s) => ({ ...s.summary, ...s.flags })));
+      const outside = new Set(saved.flatMap(([id, s]) => keepThread(account, mirror.validity, id, s!, win)));
+      const stored = [...outside].map((u) => ({ summary: known.get(u), flags: cache.get<Flags>('oflags', `${account.id}:${mirror.validity}:${u}`) }));
+      if (stored.every((s) => s.summary && s.flags)) return withRoles(entry, stored.map((s) => ({ ...s.summary!, ...s.flags! })));
     }
   }
   return withMailbox(account, path, async ({ client }) => {
-    const validity = String(client.mailbox.uidValidity);
+    const validity = String(selected(client).uidValidity);
     const win = mirror?.validity === validity ? allMailWindow(account, path, mirror, ids) : NO_WINDOW;
-    const thrKey = (id) => `${account.id}:${validity}:${id}`;
-    const uids = new Set();
-    const fetched = new Map(); // uid -> summary, from this call
-    const unknown = [];
+    const thrKey = (id: string) => `${account.id}:${validity}:${id}`;
+    const uids = new Set<number>();
+    const fetched = new Map<number, Summary>(); // uid -> summary, from this call
+    const unknown: string[] = [];
     for (const id of ids) {
       const saved = storedThread(thrKey(id), id, win, startsNew);
       if (saved) keepThread(account, validity, id, saved, win).forEach((u) => uids.add(u));
       else unknown.push(id);
     }
-    const upTo = client.mailbox.uidNext; // a search sees every message below this
+    const upTo = selected(client).uidNext; // a search sees every message below this
     for (let i = 0; i < unknown.length; i += 50) {
       const chunk = unknown.slice(i, i + 50);
-      const criteria = chunk.length === 1 ? { threadId: chunk[0] } : { or: chunk.map((threadId) => ({ threadId })) };
+      const criteria: SearchObject = chunk.length === 1 ? { threadId: chunk[0] } : { or: chunk.map((threadId) => ({ threadId })) };
       const found = (await client.search(criteria, { uid: true })) || [];
-      const members = new Map(chunk.map((id) => [id, []]));
+      const members = new Map<string, number[]>(chunk.map((id) => [id, []]));
       if (found.length) {
         for (const s of await fetchSummaries(client, account, path, found.join(','), true)) {
           fetched.set(s.uid, s);
           uids.add(s.uid);
-          if (!members.has(s.threadId)) members.set(s.threadId, []);
-          members.get(s.threadId).push(s.uid);
+          if (!members.has(s.threadId!)) members.set(s.threadId!, []);
+          members.get(s.threadId!)!.push(s.uid);
         }
       }
       for (const [id, list] of members) keepThread(account, validity, id, { uids: list, upTo }, win);
@@ -791,7 +862,7 @@ async function gmailThreads(account, entry, threadIds, startsNew = new Set()) {
     // Messages in the mirrored window come from the mirror; the rest need their flags.
     const outside = [...uids].filter((u) => !win.uids.has(u));
     const toFetch = outside.filter((u) => !fetched.has(u));
-    const out = outside.filter((u) => fetched.has(u)).map((u) => fetched.get(u));
+    const out = outside.filter((u) => fetched.has(u)).map((u) => fetched.get(u)!);
     if (toFetch.length) out.push(...(await fetchSummaries(client, account, path, toFetch.join(','), true)));
     for (const m of out) {
       cache.put('oflags', `${account.id}:${validity}:${m.uid}`, pickFlags(m));
@@ -802,31 +873,31 @@ async function gmailThreads(account, entry, threadIds, startsNew = new Set()) {
 
 // Messages from other folders that may belong to the same conversations as
 // `items` (for example your replies in Sent), read from mirrored windows.
-async function related(account, folderKey, items) {
+export async function related(account: Account, folderKey: string | null, items: Summary[]): Promise<Summary[]> {
   const entry = await connect(account);
   if (entry.gmail && entry.folders.all) {
     const window = (await listPath(account, entry.folders.all, RELATED_WINDOW)).messages;
-    const ids = [...new Set(items.map((m) => m.threadId).filter(Boolean))];
+    const ids = [...new Set(items.map((m) => m.threadId).filter((id): id is string => Boolean(id)))];
     // A conversation starting with a message that isn't a reply has nothing
     // older, as long as that message's All Mail copy is in the window.
-    const copyId = (m) => m.emailId || m.messageId;
+    const copyId = (m: Summary) => m.emailId || m.messageId;
     const inWindow = new Set(window.map(copyId).filter(Boolean));
     const startsNew = new Set(
-      items.filter((m) => m.threadId && !m.inReplyTo && !m.references?.length && inWindow.has(copyId(m))).map((m) => m.threadId)
+      items.filter((m) => m.threadId && !m.inReplyTo && !m.references?.length && inWindow.has(copyId(m))).map((m) => m.threadId!)
     );
     return [...window, ...(await gmailThreads(account, entry, ids, startsNew))];
   }
   const own = new Set(items.map((m) => m.folder));
   const paths = ['INBOX', entry.folders.sent].filter((p) => p && !own.has(p));
-  const out = [];
+  const out: Summary[] = [];
   for (const path of paths) out.push(...(await listPath(account, path, RELATED_WINDOW)).messages);
   return out;
 }
 
 // One message plus the messages that could be in its conversation.
-async function threadCandidates(account, path, uid) {
+export async function threadCandidates(account: Account, path: string, uid: number): Promise<{ target: Summary; candidates: Summary[] }> {
   const entry = await connect(account);
-  let target;
+  let target: Summary | undefined;
   for (let stage = -1; stage <= 2 && !target; stage++) {
     [target] = await withMailbox(account, path, async ({ client }) => {
       if (stage >= 0) await refreshSelection(client, path, stage); // a just-arrived message may be invisible to this connection
@@ -842,7 +913,7 @@ async function threadCandidates(account, path, uid) {
     const window = (await listPath(account, entry.folders.all, RELATED_WINDOW)).messages;
     return { target, candidates: [...window, ...(await gmailThreads(account, entry, [target.threadId]))] };
   }
-  const candidates = [];
+  const candidates: Summary[] = [];
   for (const p of new Set(['INBOX', entry.folders.sent, path].filter(Boolean))) {
     candidates.push(...(await listPath(account, p, RELATED_WINDOW)).messages);
   }
@@ -851,7 +922,7 @@ async function threadCandidates(account, path, uid) {
 
 // ---------- snippets ----------
 
-function decodeQuotedPrintable(buf) {
+function decodeQuotedPrintable(buf: Buffer): Buffer {
   const str = buf.toString('latin1').replace(/=\r?\n/g, '');
   return Buffer.from(
     str.replace(/=([0-9A-F]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
@@ -859,7 +930,7 @@ function decodeQuotedPrintable(buf) {
   );
 }
 
-function decodePart(buf, info, alreadyDecoded) {
+function decodePart(buf: Buffer, info: Inbox.TextPartInfo, alreadyDecoded: boolean | undefined): string {
   let bytes = buf;
   if (!alreadyDecoded) {
     if (info.encoding === 'base64') {
@@ -876,9 +947,9 @@ function decodePart(buf, info, alreadyDecoded) {
   }
 }
 
-const ENTITIES = { nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", zwnj: '', shy: '' };
+const ENTITIES: Record<string, string> = { nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", zwnj: '', shy: '' };
 
-function htmlToText(html) {
+function htmlToText(html: string): string {
   return html
     .replace(/^[\s\S]*?<body[^>]*>/i, '')
     .replace(/<(style|script|head|title)[^>]*>[\s\S]*?(<\/\1>|$)/gi, ' ')
@@ -895,14 +966,14 @@ const HTML_QUOTE_START = /<(?:div|blockquote)\b[^>]*(?:gmail_quote|yahoo_quoted|
 // ("On ... wrote:" ends its line; long attributions wrap onto a second line.)
 const PLAIN_QUOTE_START = /^[ \t]*(?:On\b[^\n]{0,300}(?:\n[^\n]{0,200})?\bwrote:[ \t]*$|-{2,}\s*Original Message\s*-{2,}|_{10,}|>)/im;
 
-function withoutQuotedHistory(text, isHtml) {
+function withoutQuotedHistory(text: string, isHtml: boolean): string {
   const cut = text.search(isHtml ? HTML_QUOTE_START : PLAIN_QUOTE_START);
   if (cut <= 0) return text;
   const head = text.slice(0, cut);
   return (isHtml ? htmlToText(head) : head).trim() ? head : text;
 }
 
-function toSnippet(text, isHtml) {
+function toSnippet(text: string, isHtml: boolean): string {
   const plain = isHtml ? htmlToText(withoutQuotedHistory(text, true)) : withoutQuotedHistory(text, false);
   return plain
     .replace(/[͏​-‍⁠﻿­]/g, '')
@@ -915,25 +986,25 @@ function toSnippet(text, isHtml) {
 // Fills in .snippet for the given summaries (all from one account), fetching
 // only the first few KB of each message's text part. Previews are stored with
 // the summary, so each one is fetched once, ever.
-async function fillSnippets(account, items) {
-  const byFolder = new Map();
+export async function fillSnippets(account: Account, items: Summary[]): Promise<void> {
+  const byFolder = new Map<string, Summary[]>();
   for (const item of items) {
     if (!item._text || item.snippet || item.snippetDone) continue;
     if (!byFolder.has(item.folder)) byFolder.set(item.folder, []);
-    byFolder.get(item.folder).push(item);
+    byFolder.get(item.folder)!.push(item);
   }
   for (const [path, folderItems] of byFolder) {
     await withMailbox(account, path, async ({ client }) => {
-      const known = summaryStore(account, path, client.mailbox.uidValidity);
+      const known = summaryStore(account, path, selected(client).uidValidity);
       // Messages sharing a text part id can be fetched in a single command.
-      const byPart = new Map();
+      const byPart = new Map<string, Summary[]>();
       for (const item of folderItems) {
-        const k = `${item._text.part}|${item._text.type}`;
+        const k = `${item._text!.part}|${item._text!.type}`;
         if (!byPart.has(k)) byPart.set(k, []);
-        byPart.get(k).push(item);
+        byPart.get(k)!.push(item);
       }
       for (const group of byPart.values()) {
-        const { part, type } = group[0]._text;
+        const { part, type } = group[0]._text!;
         const maxLength = type === 'text/html' ? 24000 : 3000;
         const byUid = new Map(group.map((i) => [i.uid, i]));
         const fetched = await client.fetchAll(
@@ -945,7 +1016,7 @@ async function fillSnippets(account, items) {
           const item = byUid.get(msg.uid);
           const [key, buf] = (msg.bodyParts && [...msg.bodyParts.entries()][0]) || [];
           if (!item || !buf) continue;
-          const decoded = decodePart(buf, item._text, msg.binaryParts?.has(key));
+          const decoded = decodePart(buf, item._text!, msg.binaryParts?.has(key!));
           item.snippet = toSnippet(decoded, type === 'text/html');
           const stored = known.get(item.uid);
           if (stored) known.set(item.uid, { ...stored, snippet: item.snippet, snippetDone: true });
@@ -957,38 +1028,38 @@ async function fillSnippets(account, items) {
 
 // ---------- full messages ----------
 
-function lru(max) {
-  const map = new Map();
+function lru<V>(max: number) {
+  const map = new Map<string, V>();
   return {
-    get(key) {
+    get(key: string): V | undefined {
       if (!map.has(key)) return undefined;
       const value = map.get(key);
       map.delete(key);
-      map.set(key, value);
+      map.set(key, value as V);
       return value;
     },
-    set(key, value) {
+    set(key: string, value: V): void {
       map.delete(key);
-      map.set(key, value);
-      if (map.size > max) map.delete(map.keys().next().value);
+      map.set(key, value as V);
+      if (map.size > max) map.delete(map.keys().next().value!);
     },
   };
 }
 // Parsed messages in memory; raw sources on disk (cache.js).
-const parsedCache = lru(200);
+const parsedCache = lru<Inbox.FullMessage>(200);
 
-const sourceKey = (account, path, uid) => `${account.id}:${path}:${loadMirror(`${account.id}:${path}`)?.validity || '0'}:${uid}`;
+const sourceKey = (account: Account, path: string, uid: number) => `${account.id}:${path}:${loadMirror(`${account.id}:${path}`)?.validity || '0'}:${uid}`;
 
-async function getSource(account, path, uid) {
+async function getSource(account: Account, path: string, uid: number): Promise<Buffer> {
   const key = sourceKey(account, path, uid);
   const saved = cache.getSource(key);
   if (saved) return saved;
   const source = await withMailbox(account, path, async ({ client }) => {
-    const msg = await fetchOneRefreshing(client, path, uid, { uid: true, source: true }, (m) => !!m?.source);
+    const msg = (await fetchOneRefreshing(client, path, uid, { uid: true, source: true }, (m) => !!(m as FetchMessageObject)?.source)) as FetchMessageObject | undefined;
     if (!msg?.source) {
       // Still listed by the server although its content can't be had: a phantom.
       const listed = await client.search({ uid: String(uid) }, { uid: true });
-      if (listed?.includes(Number(uid))) markPhantoms(account, path, [uid]);
+      if ((listed as number[] | undefined)?.includes(Number(uid))) markPhantoms(account, path, [uid]);
       else dropFromMirror(account, path, [uid]);
       throw Object.assign(new Error('Message not found'), { status: 404 });
     }
@@ -998,17 +1069,17 @@ async function getSource(account, path, uid) {
   return source;
 }
 
-function addressList(field) {
-  return field?.value?.map((v) => ({ name: v.name, address: v.address })) || [];
+function addressList(field: AddressObject | AddressObject[] | undefined): Inbox.Address[] {
+  return (field as AddressObject | undefined)?.value?.map((v) => ({ name: v.name, address: v.address as string })) || [];
 }
 
-async function parseMessage(account, path, uid) {
+async function parseMessage(account: Account, path: string, uid: number): Promise<Inbox.FullMessage> {
   const key = `${account.id}:${path}:${uid}`;
   const cached = parsedCache.get(key);
   if (cached) return cached;
   // Keep cid: links; the service rewrites them to mailpart:// URLs.
   const parsed = await simpleParser(await getSource(account, path, uid), { skipImageLinks: true });
-  const msg = {
+  const msg: Inbox.FullMessage = {
     accountId: account.id,
     folder: path,
     uid,
@@ -1022,7 +1093,7 @@ async function parseMessage(account, path, uid) {
     plain: !parsed.html,
     text: parsed.text || '',
     messageId: parsed.messageId || '',
-    references: [].concat(parsed.references || []),
+    references: ([] as string[]).concat(parsed.references || []),
     attachments: parsed.attachments.map((a, idx) => ({
       idx,
       filename: a.filename || `attachment-${idx + 1}`,
@@ -1038,7 +1109,7 @@ async function parseMessage(account, path, uid) {
 
 // Opens a message. Marking it read happens in the background, so the
 // message shows as soon as its content is here.
-async function get(account, path, uid, { markSeen = true } = {}) {
+export async function get(account: Account, path: string, uid: number, { markSeen = true } = {}): Promise<Inbox.FullMessage> {
   const msg = await parseMessage(account, path, uid);
   if (markSeen) {
     withMailbox(account, path, ({ client }) => client.messageFlagsAdd(String(uid), ['\\Seen'], { uid: true })).catch(() => {});
@@ -1048,7 +1119,7 @@ async function get(account, path, uid, { markSeen = true } = {}) {
 
 // Downloads messages ahead of time (one command per folder) and keeps them on
 // disk, like Gmail's offline mail, so opening them needs no network at all.
-async function prefetch(account, path, uids) {
+export async function prefetch(account: Account, path: string, uids: number[]): Promise<void> {
   const missing = uids.filter((uid) => !cache.getSource(sourceKey(account, path, uid)));
   if (!missing.length) return;
   await withMailbox(account, path, async ({ client }) => {
@@ -1058,13 +1129,13 @@ async function prefetch(account, path, uids) {
   });
 }
 
-async function attachment(account, path, uid, idx) {
+export async function attachment(account: Account, path: string, uid: number, idx: number): Promise<AttachmentContent | undefined> {
   const parsed = await simpleParser(await getSource(account, path, uid));
   return parsed.attachments[idx];
 }
 
 // Regular (non-inline) attachments, for forwarding.
-async function forwardAttachments(account, path, uid) {
+export async function forwardAttachments(account: Account, path: string, uid: number): Promise<AttachmentContent[]> {
   const parsed = await simpleParser(await getSource(account, path, uid));
   return parsed.attachments
     .filter((a) => !a.related)
@@ -1073,14 +1144,14 @@ async function forwardAttachments(account, path, uid) {
 
 // ---------- push: new mail the moment it arrives ----------
 
-const watchers = new Set();
+const watchers = new Set<string>();
 
 // Keeps a connection idling on the Inbox; the server tells it about new mail,
 // deletions and flag changes right away (IMAP IDLE).
-async function watch(account, onChange) {
+export async function watch(account: Account, onChange: (accountId: string) => void): Promise<void> {
   if (watchers.has(account.id)) return;
   watchers.add(account.id);
-  let timer;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const changed = () => {
     clearTimeout(timer);
     timer = setTimeout(() => onChange(account.id), 150);
@@ -1104,9 +1175,9 @@ async function watch(account, onChange) {
 // ---------- actions ----------
 
 // "1,2,3,7,9,10" -> "1:3,7,9:10": a whole mailbox's worth of UIDs stays one short command.
-function uidSet(uids) {
+function uidSet(uids: (number | string)[]): string {
   const sorted = [...new Set(uids.map(Number))].sort((a, b) => a - b);
-  const parts = [];
+  const parts: string[] = [];
   for (let i = 0; i < sorted.length; ) {
     let j = i;
     while (j + 1 < sorted.length && sorted[j + 1] === sorted[j] + 1) j++;
@@ -1116,7 +1187,7 @@ function uidSet(uids) {
   return parts.join(',');
 }
 
-async function setFlags(account, path, uids, { seen, flagged }) {
+export async function setFlags(account: Account, path: string, uids: number[], { seen, flagged }: FlagChanges): Promise<void> {
   return withMailbox(account, path, async ({ client }) => {
     const range = uidSet(uids);
     if (seen === true) await client.messageFlagsAdd(range, ['\\Seen'], { uid: true });
@@ -1128,7 +1199,7 @@ async function setFlags(account, path, uids, { seen, flagged }) {
 
 // Gmail keeps importance as a label (other providers have none; the app
 // remembers the choice itself, see service.js).
-async function setImportant(account, path, uids, important) {
+export async function setImportant(account: Account, path: string, uids: number[], important: boolean): Promise<unknown> {
   const entry = await connect(account);
   if (!entry.gmail) return;
   return withMailbox(account, path, ({ client }) =>
@@ -1138,7 +1209,7 @@ async function setImportant(account, path, uids, important) {
   );
 }
 
-async function archiveFolder(account, entry) {
+async function archiveFolder(account: Account, entry: Entry): Promise<string | undefined> {
   if (entry.gmail) return entry.folders.all;
   if (entry.folders.archive) return entry.folders.archive;
   await entry.client.mailboxCreate('Archive').catch(() => {});
@@ -1146,7 +1217,7 @@ async function archiveFolder(account, entry) {
   return 'Archive';
 }
 
-async function move(account, path, uids, target) {
+export async function move(account: Account, path: string, uids: number[], target: MoveTarget): Promise<unknown> {
   const entry = await connect(account);
   if (target === 'archive' && path !== 'INBOX') {
     // Archiving takes a conversation out of the inbox. Gmail copies found
@@ -1158,7 +1229,7 @@ async function move(account, path, uids, target) {
     }
     return;
   }
-  let dest;
+  let dest: string | undefined;
   if (target === 'archive') dest = await archiveFolder(account, entry);
   else if (target === 'inbox') dest = 'INBOX';
   else dest = entry.folders[target];
@@ -1172,7 +1243,7 @@ async function move(account, path, uids, target) {
 
 // After moving or deleting messages: out of the list now. Any the server
 // still lists are phantoms (they refuse to move) and are left out for good.
-async function forgetRemoved(client, account, path, uids) {
+async function forgetRemoved(client: ImapFlow, account: Account, path: string, uids: number[]): Promise<void> {
   const still = new Set((await client.search({ uid: uidSet(uids) }, { uid: true }).catch(() => [])) || []);
   const stuck = uids.map(Number).filter((u) => still.has(u));
   dropFromMirror(account, path, uids);
@@ -1180,7 +1251,7 @@ async function forgetRemoved(client, account, path, uids) {
 }
 
 // Moves to Trash, or deletes for good when already in Trash/Spam.
-async function remove(account, path, uids) {
+export async function remove(account: Account, path: string, uids: number[]): Promise<unknown> {
   const entry = await connect(account);
   const { trash, spam } = entry.folders;
   if (trash && path !== trash && path !== spam) return move(account, path, uids, 'trash');
@@ -1192,22 +1263,22 @@ async function remove(account, path, uids) {
 
 // ---------- counts ----------
 
-async function counts(account) {
+export async function counts(account: Account): Promise<Inbox.AccountCounts> {
   const entry = await connect(account);
-  const result = {};
-  const want = { inbox: 'unseen', spam: 'unseen', drafts: 'messages' };
+  const result: Record<string, number> = {};
+  const want = { inbox: 'unseen', spam: 'unseen', drafts: 'messages' } as const;
   for (const [key, field] of Object.entries(want)) {
     const path = entry.folders[key];
     if (!path) continue;
     const status = await withClient(account, (e) => e.client.status(path, { [field]: true }));
-    result[key] = status?.[field] ?? 0;
+    result[key] = (status as StatusObject)?.[field] ?? 0;
   }
   return result;
 }
 
 // ---------- sending ----------
 
-async function transportFor(account) {
+async function transportFor(account: Account) {
   const proxy = await proxyFor(account.smtp);
   const transport = nodemailer.createTransport({
     host: account.smtp.host,
@@ -1221,9 +1292,9 @@ async function transportFor(account) {
   return transport;
 }
 
-async function send(account, mail) {
+export async function send(account: Account, mail: OutgoingMessage): Promise<string> {
   const domain = account.email.split('@')[1] || 'localhost';
-  const message = {
+  const message: Mail.Options & { messageId: string } = {
     from: { name: account.senderName || '', address: account.email },
     to: mail.to,
     cc: mail.cc || undefined,
@@ -1252,8 +1323,8 @@ async function send(account, mail) {
 
 // ---------- connection test ----------
 
-async function test(account) {
-  const tryImap = async (proxy) => {
+export async function test(account: Account): Promise<void> {
+  const tryImap = async (proxy: string | null) => {
     const client = newClient(account, 'fg', proxy);
     try {
       await client.connect();
@@ -1279,29 +1350,5 @@ async function test(account) {
   }
 }
 
-module.exports = {
-  _test: { fetchOneRefreshing, refreshSelection, toSnippet, uidSet },
-  inLane,
-  warmUp,
-  watch,
-  list,
-  listFiltered,
-  search,
-  related,
-  threadCandidates,
-  fillSnippets,
-  get,
-  prefetch,
-  attachment,
-  forwardAttachments,
-  setFlags,
-  setImportant,
-  move,
-  remove,
-  counts,
-  send,
-  test,
-  disconnect,
-  friendlyError,
-  setProxyResolver,
-};
+// For tests.
+export const _test = { fetchOneRefreshing, refreshSelection, toSnippet, uidSet };

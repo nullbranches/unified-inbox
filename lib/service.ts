@@ -4,45 +4,66 @@
 // Views are served Gmail-style from the local database first ("stale while
 // revalidate"): a list you've seen before comes back instantly, a background
 // sync brings it up to date, and changes are announced through `events`.
-const { EventEmitter } = require('events');
-const store = require('./store');
-const cache = require('./cache');
-const tracking = require('./tracking');
-const imap = require('./imap');
-const demo = require('./demo');
-const { PROVIDERS, guessProvider } = require('./providers');
+import { EventEmitter } from 'events';
+import * as store from './store';
+import * as cache from './cache';
+import * as tracking from './tracking';
+import type { TrackRecord } from './tracking';
+import * as imap from './imap';
+import * as demo from './demo';
+import { PROVIDERS, guessProvider } from './providers';
+import type { Account, AnyAccount, AttachmentContent, Backend, ListResult } from './types';
+
+type Summary = Inbox.MessageSummary;
+type Thread = Inbox.Thread;
+
+// A new message, for the new-mail alert.
+export interface NewMailAlert {
+  key: string;
+  account: string;
+  from: string;
+  subject: string;
+  snippet: string;
+}
+
+interface ServiceEvents {
+  view: [Inbox.ViewUpdate];
+  mail: [string];
+  'new-mail': [NewMailAlert[]];
+  opened: [TrackRecord[]];
+}
 
 // 'view' {key, data} | 'mail' accountId | 'new-mail' [messages] | 'opened' {record, open}
-const events = new EventEmitter();
+export const events = new EventEmitter<ServiceEvents>();
 
 const PAGE_SIZE = 50;
 const EVERYTHING_LIMIT = 1000;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 
-function accounts() {
+function accounts(): AnyAccount[] {
   const real = store.getAccounts();
   return real.length ? real : demo.ACCOUNTS;
 }
 
-const backend = (account) => (account.demo ? demo : imap);
+const backend = (account: AnyAccount): Backend<AnyAccount> => (account.demo ? demo : imap) as Backend<AnyAccount>;
 
-function accountById(id) {
+function accountById(id: string): AnyAccount {
   const account = accounts().find((a) => a.id === id);
   if (!account) throw new Error('That account no longer exists.');
   return account;
 }
 
-function groupBy(items, keyFn) {
-  const groups = new Map();
+function groupBy<T, K>(items: T[], keyFn: (item: T) => K): Map<K, T[]> {
+  const groups = new Map<K, T[]>();
   for (const item of items) {
     const key = keyFn(item);
     if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(item);
+    groups.get(key)!.push(item);
   }
   return groups;
 }
 
-function getState() {
+export function getState() {
   const real = store.getAccounts();
   return {
     demo: real.length === 0,
@@ -52,9 +73,9 @@ function getState() {
 }
 
 // Background work (syncing, counts, prefetch) uses each account's second IMAP connection.
-const inBackground = (fn) => imap.inLane('bg', fn);
+const inBackground = <T>(fn: () => T): T => imap.inLane('bg', fn);
 
-function initCache(dataDir) {
+export function initCache(dataDir: string): void {
   cache.init(dataDir);
   tracking.init(dataDir);
 }
@@ -63,8 +84,8 @@ function initCache(dataDir) {
 
 // Each tracked message gets .track; a conversation shows the state of the
 // last tracked message in it (✓ sent, ✓✓ opened).
-function markThread(t) {
-  let last = null;
+function markThread(t: Thread): Thread {
+  let last: Inbox.TrackStatus | null = null;
   for (const m of t.messages) {
     m.track = tracking.statusFor(m.messageId);
     if (m.track) last = m.track;
@@ -73,33 +94,33 @@ function markThread(t) {
   return t;
 }
 
-function withTracking(data) {
+function withTracking(data: Inbox.ViewResult): Inbox.ViewResult {
   for (const t of [...(data.sections || []).flatMap((s) => s.threads), ...(data.threads || [])]) markThread(t);
   return data;
 }
 
 // Checks the tracker for opens; announces new ones (for alerts and the ✓✓ marks).
-async function pollTracking() {
-  const opened = await tracking.poll().catch(() => []);
+export async function pollTracking(): Promise<number> {
+  const opened = await tracking.poll().catch((): TrackRecord[] => []);
   if (opened.length) events.emit('opened', opened);
   return opened.length;
 }
 
-const trackingConfig = () => tracking.publicConfig();
-const setTracking = (config) => tracking.setConfig(config);
+export const trackingConfig = () => tracking.publicConfig();
+export const setTracking = (config: { url?: string; secret?: string }) => tracking.setConfig(config);
 
 // ---------- outgoing message bodies ----------
 
-const escapeHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+const escapeHtml = (s: unknown) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' } as Record<string, string>)[c]);
 const QUOTE_OPEN =
   '<blockquote class="gmail_quote" style="margin:0px 0px 0px 0.8ex;border-left:1px solid rgb(204,204,204);padding-left:1ex">';
 
 // Plain-text quoting ("> " per level) as HTML: nested blockquotes, like Gmail.
-function quoteToHtml(text) {
+function quoteToHtml(text: string): string {
   let depth = 0;
   let out = '';
   for (const line of String(text).replace(/\s+$/, '').split(/\r?\n/)) {
-    const m = line.match(/^((?:\s*>)*)\s?(.*)$/);
+    const m = line.match(/^((?:\s*>)*)\s?(.*)$/)!;
     const d = (m[1].match(/>/g) || []).length;
     while (depth < d) {
       out += QUOTE_OPEN;
@@ -115,7 +136,7 @@ function quoteToHtml(text) {
 }
 
 // The text part of a reply: what you wrote, then the original quoted with "> ".
-function quotedPlainText(quote) {
+function quotedPlainText(quote: Inbox.Quote): string {
   const lines = String(quote.text)
     .replace(/\s+$/, '')
     .split(/\r?\n/)
@@ -126,7 +147,7 @@ function quotedPlainText(quote) {
 // The HTML part: your text, then (for replies) the quoted original in the
 // structure Gmail uses, so mail apps (this one too) fold it behind "•••".
 // The "ui-simple" marker lets this app show it like plain text in dark mode.
-function composeHtml(text, quote) {
+function composeHtml(text: string, quote: Inbox.Quote | null): string {
   let html = `<div class="ui-simple" dir="ltr" style="font-family:Arial,Helvetica,sans-serif;font-size:14px">${escapeHtml(text).replace(/\r?\n/g, '<br>')}</div>`;
   if (quote) {
     html += `<br><div class="gmail_quote"><div dir="ltr" class="gmail_attr">${escapeHtml(quote.attribution)}<br></div>${QUOTE_OPEN}${quoteToHtml(quote.text)}</blockquote></div>`;
@@ -134,27 +155,27 @@ function composeHtml(text, quote) {
   return html;
 }
 
-function flushCache() {
+export function flushCache(): void {
   cache.flush();
 }
 
-function warmUp() {
+export function warmUp(): void {
   for (const a of accounts()) backend(a).warmUp(a);
 }
 
 // New mail is pushed by the server (IMAP IDLE) instead of waiting for a poll.
-function startWatching() {
+export function startWatching(): void {
   for (const a of store.getAccounts()) imap.watch(a, onMailPushed);
 }
 
 // The server reported a change in an account's Inbox: re-sync the inbox views
 // that include it right away (the window gets them as 'view' events), then
 // tell the window so it can refresh counts.
-async function onMailPushed(accountId) {
+async function onMailPushed(accountId: string): Promise<void> {
   const keys = new Set(cache.entries('view', '').map(([key]) => key));
   keys.add(viewKeyOf({})); // the unified inbox, even if it was never opened
   const views = [...keys]
-    .map((key) => ({ key, v: JSON.parse(key) }))
+    .map((key) => ({ key, v: JSON.parse(key) as ViewKeyParts }))
     .filter(({ v }) => v[0] === 'inbox' && (v[1] === 'all' || v[1] === accountId))
     // The unified inbox's first page first: it's what's usually on screen.
     .sort((a, b) => Number(b.v[1] === 'all' && b.v[2] === 1) - Number(a.v[1] === 'all' && a.v[2] === 1));
@@ -172,12 +193,12 @@ async function onMailPushed(accountId) {
 const AUTOMATED = /^(no[-_.]?reply|do[-_.]?not[-_.]?reply|notifications?|notify|newsletters?|news|alerts?|updates?|marketing|mailer-daemon|postmaster|bounces?|info|support|hello|team|digest|billing|statements?|orders?|receipts?)([._+-]|$)/i;
 // "noreply" anywhere in the name (invitations-noreply@, calendar.no-reply@).
 const NO_REPLY = /(^|[._+-])(no[-_.]?reply|do[-_.]?not[-_.]?reply)([._+-]|$)/i;
-const isAutomated = (address) => {
+const isAutomated = (address: string) => {
   const name = address.split('@')[0];
   return AUTOMATED.test(name) || NO_REPLY.test(name);
 };
 
-const addressOf = (a) => String(a?.address || '').toLowerCase();
+const addressOf = (a: Inbox.Address | undefined) => String(a?.address || '').toLowerCase();
 
 // Your own choice (for the message, then for its sender) always wins. After
 // that, mail from automated senders (no-reply@, support@, …) and a message
@@ -186,15 +207,15 @@ const addressOf = (a) => String(a?.address || '').toLowerCase();
 // \Important label); for other accounts, ongoing conversations are important
 // unless they're bulk mail (mailing lists, newsletters), and high priority
 // mail always is.
-function markImportance(threads) {
+function markImportance(threads: Thread[]): Thread[] {
   for (const t of threads) {
     for (const m of t.messages) {
       const from = addressOf(m.from);
-      const choice = m.messageId ? cache.get('imp', `${m.accountId}:${String(m.messageId).toLowerCase()}`) : undefined;
+      const choice = m.messageId ? cache.get<boolean>('imp', `${m.accountId}:${String(m.messageId).toLowerCase()}`) : undefined;
       const startsConversation = t.messages.length === 1 && !m.inReplyTo && !m.references?.length;
       m.important =
         choice ??
-        cache.get('impSender', from) ??
+        cache.get<boolean | null>('impSender', from) ??
         (isAutomated(from) || startsConversation
           ? false
           : m.gmImportant ?? (!!m.priorityHigh || !m.bulk));
@@ -206,7 +227,7 @@ function markImportance(threads) {
 
 // ---------- conversations ----------
 
-const keyOf = (m) => `${m.accountId}|${m.folder}|${m.uid}`;
+const keyOf = (m: Inbox.MessageRef) => `${m.accountId}|${m.folder}|${m.uid}`;
 
 // Folders whose rows also pull in replies from other folders (like Sent).
 const THREADED = new Set(['inbox', 'starred', 'sent', 'all', 'search']);
@@ -215,10 +236,10 @@ const THREADED = new Set(['inbox', 'starred', 'sent', 'all', 'search']);
 // of the folder being viewed; `extra` are messages from elsewhere that only
 // join a conversation if it already has a primary message. Gmail conversation
 // IDs are used when present, otherwise Message-ID / In-Reply-To / References.
-function buildThreads(primary, extra) {
-  const all = [];
-  const seen = new Map(); // id -> the copy kept
-  for (const [list, isPrimary] of [[primary, true], [extra, false]]) {
+function buildThreads(primary: Summary[], extra: Summary[]): Thread[] {
+  const all: Summary[] = [];
+  const seen = new Map<string, Summary>(); // id -> the copy kept
+  for (const [list, isPrimary] of [[primary, true], [extra, false]] as const) {
     for (const m of list) {
       // The same message can show up in two folders (Inbox and All Mail, or a
       // note to yourself in Inbox and Sent); keep the copy from this folder,
@@ -237,16 +258,16 @@ function buildThreads(primary, extra) {
     }
   }
 
-  const parent = new Map();
-  const root = (x) => {
+  const parent = new Map<string, string>();
+  const root = (x: string) => {
     if (!parent.has(x)) parent.set(x, x);
     while (parent.get(x) !== x) {
-      parent.set(x, parent.get(parent.get(x)));
-      x = parent.get(x);
+      parent.set(x, parent.get(parent.get(x)!)!);
+      x = parent.get(x)!;
     }
     return x;
   };
-  const join = (a, b) => parent.set(root(a), root(b));
+  const join = (a: string, b: string) => parent.set(root(a), root(b));
   for (const m of all) {
     const node = `k:${keyOf(m)}`;
     root(node);
@@ -259,7 +280,7 @@ function buildThreads(primary, extra) {
     }
   }
 
-  const threads = [];
+  const threads: Thread[] = [];
   for (const members of groupBy(all, (m) => root(`k:${keyOf(m)}`)).values()) {
     const own = members.filter((m) => m.primary);
     if (!own.length) continue;
@@ -277,7 +298,7 @@ function buildThreads(primary, extra) {
       starred: members.some((m) => m.starred),
       hasAttachments: members.some((m) => m.hasAttachments),
       files: members.flatMap((m) => m.files || []),
-      roles: [...new Set(members.map((m) => m.role).filter(Boolean))],
+      roles: [...new Set(members.map((m) => m.role).filter((r): r is string => Boolean(r)))],
       draft: members.some((m) => m.draft),
       count: members.length,
       messages: members,
@@ -287,11 +308,11 @@ function buildThreads(primary, extra) {
 }
 
 // With conversation view off, every message is its own row.
-function singleThreads(primary) {
+function singleThreads(primary: Summary[]): Thread[] {
   return primary.map((m) => buildThreads([m], [])[0]);
 }
 
-async function fillThreadSnippets(threads, all = false) {
+async function fillThreadSnippets(threads: Thread[], all = false): Promise<void> {
   const items = threads.flatMap((t) => (all ? t.messages : [t.messages[t.messages.length - 1]]));
   await Promise.allSettled(
     [...groupBy(items, (m) => m.accountId)].map(([id, list]) => {
@@ -309,7 +330,13 @@ async function fillThreadSnippets(threads, all = false) {
 
 // Fetches and groups one view for every target account. `fetch` returns { total, messages }.
 // quick: skip looking in other folders for the rest of each conversation.
-async function collect(targets, fetch, threaded, folderKey, quick = false) {
+async function collect(
+  targets: AnyAccount[],
+  fetch: (b: Backend<AnyAccount>, a: AnyAccount) => Promise<ListResult>,
+  threaded: boolean,
+  folderKey: string,
+  quick = false
+): Promise<Inbox.EverythingResult> {
   const results = await Promise.allSettled(
     targets.map(async (a) => {
       const b = backend(a);
@@ -320,8 +347,8 @@ async function collect(targets, fetch, threaded, folderKey, quick = false) {
     })
   );
   let complete = true;
-  const threads = [];
-  const errors = [];
+  const threads: Thread[] = [];
+  const errors: Inbox.ViewError[] = [];
   results.forEach((r, i) => {
     const a = targets[i];
     if (r.status === 'fulfilled') {
@@ -335,22 +362,25 @@ async function collect(targets, fetch, threaded, folderKey, quick = false) {
   return { complete, threads, errors };
 }
 
-const SECTION_TITLES = { unread: 'Unread', starred: 'Starred', important: 'Important' };
+const SECTION_TITLES: Record<string, string> = { unread: 'Unread', starred: 'Starred', important: 'Important' };
 const SECTION_SIZES = [5, 10, 25, 50]; // Gmail's "Show up to N items"
-const sectionSizeOf = (n) => (SECTION_SIZES.includes(Number(n)) ? Number(n) : 25);
+const sectionSizeOf = (n: unknown) => (SECTION_SIZES.includes(Number(n)) ? Number(n) : 25);
 
 // sectionPage: the page of the inbox-type section (Important / Unread / Starred), paged on its own like Gmail's.
 // sectionSize: how many conversations one page of that section shows.
-const viewKeyOf = ({ folder = 'inbox', account = 'all', page = 1, q = '', threading = true, inboxType = 'default', sectionPage = 1, sectionSize = 25 }) =>
+// [folder or "search", account, page, q, threading, inboxType, sectionPage, sectionSize]
+type ViewKeyParts = [string, string, number, string, boolean, Inbox.InboxType, number, number];
+
+const viewKeyOf = ({ folder = 'inbox', account = 'all', page = 1, q = '', threading = true, inboxType = 'default', sectionPage = 1, sectionSize = 25 }: Inbox.ViewParams) =>
   JSON.stringify([q ? 'search' : folder, account, page, q, threading, inboxType, sectionPage, sectionSizeOf(sectionSize)]);
 
-const refreshing = new Map(); // view key -> { promise, again } for the in-flight background refresh
+const refreshing = new Map<string, { promise?: Promise<void>; again: boolean }>(); // view key -> { promise, again } for the in-flight background refresh
 
 // A view from the local database if we have one (marked stale, refreshed in
 // the background), otherwise fetched now. `fresh` skips the stored copy.
-async function listMessages(params = {}) {
+export async function listMessages(params: Inbox.ViewParams = {}): Promise<Inbox.ViewResult> {
   const key = viewKeyOf(params);
-  const stored = params.fresh ? null : cache.get('view', key);
+  const stored = params.fresh ? null : cache.get<Inbox.ViewResult>('view', key);
   if (stored) {
     // (no need when it was synced moments ago; pushes and polls keep it current)
     if (Date.now() - (computedAt.get(key) || 0) > 10 * 1000) refreshView(params, key);
@@ -371,14 +401,14 @@ async function listMessages(params = {}) {
 // one is running makes it run once more when it finishes, so nothing is
 // missed. urgent (pushed new mail): sync right away on the foreground
 // connection instead of waiting behind a background sync.
-function refreshView(params, key, { urgent = false } = {}) {
+function refreshView(params: Inbox.ViewParams, key: string, { urgent = false } = {}): Promise<unknown> {
   if (urgent) return imap.inLane('fg', () => computeView(params, key)).catch(() => null);
   const running = refreshing.get(key);
   if (running) {
     running.again = true;
-    return running.promise;
+    return running.promise!;
   }
-  const entry = { again: false };
+  const entry: { promise?: Promise<void>; again: boolean } = { again: false };
   entry.promise = (async () => {
     try {
       do {
@@ -390,14 +420,14 @@ function refreshView(params, key, { urgent = false } = {}) {
     }
   })();
   refreshing.set(key, entry);
-  return entry.promise;
+  return entry.promise!;
 }
 
-const computedAt = new Map(); // view key -> when it was last synced
-const startedSeq = new Map(); // view key -> number of the latest sync started
-const storedSeq = new Map(); // view key -> number of the sync whose result is stored
+const computedAt = new Map<string, number>(); // view key -> when it was last synced
+const startedSeq = new Map<string, number>(); // view key -> number of the latest sync started
+const storedSeq = new Map<string, number>(); // view key -> number of the sync whose result is stored
 
-async function computeView(params, key) {
+async function computeView(params: Inbox.ViewParams, key: string): Promise<Inbox.ViewResult> {
   const seq = (startedSeq.get(key) || 0) + 1;
   startedSeq.set(key, seq);
   const data = withTracking({ ...(await listMessagesNow(params)), viewKey: key });
@@ -417,9 +447,9 @@ async function computeView(params, key) {
 
 // Inbox messages already seen this session. The first up-to-date inbox only
 // seeds it (no alerts for mail that arrived while the app was closed).
-let inboxSeen = null;
+let inboxSeen: Set<string> | null = null;
 
-function detectNewMail(params, data) {
+function detectNewMail(params: Inbox.ViewParams, data: Inbox.ViewResult): void {
   const { folder = 'inbox', account = 'all', page = 1, q = '' } = params;
   if (folder !== 'inbox' || account !== 'all' || page !== 1 || q) return;
   const received = [...(data.sections || []).flatMap((s) => s.threads), ...data.threads].flatMap((t) =>
@@ -430,9 +460,9 @@ function detectNewMail(params, data) {
     return;
   }
   const fresh = received.filter(
-    (m) => m.unread && !inboxSeen.has(keyOf(m)) && Date.now() - new Date(m.date) < 24 * 3600 * 1000
+    (m) => m.unread && !inboxSeen!.has(keyOf(m)) && Date.now() - new Date(m.date).getTime() < 24 * 3600 * 1000
   );
-  received.forEach((m) => inboxSeen.add(keyOf(m)));
+  received.forEach((m) => inboxSeen!.add(keyOf(m)));
   // Accounts with their own notifications switched off stay silent.
   const alerts = fresh.filter((m) => accounts().find((a) => a.id === m.accountId)?.notify !== false);
   if (!alerts.length) return;
@@ -450,7 +480,7 @@ function detectNewMail(params, data) {
 
 // Which views lose a conversation when it's moved: archive leaves the inbox,
 // trash/spam leave everything but Trash/Spam, "move to inbox" leaves Trash/Spam.
-const LEAVES = {
+const LEAVES: Partial<Record<Inbox.Action, string[]>> = {
   archive: ['inbox'],
   trash: ['inbox', 'starred', 'sent', 'all', 'search', 'drafts'],
   spam: ['inbox', 'starred', 'all', 'search'],
@@ -459,16 +489,16 @@ const LEAVES = {
 
 // Applies an action to the stored views right away (like Gmail updating its
 // local store), so no view shows the old state while it re-syncs.
-function patchViews(action, items) {
+function patchViews(action: Inbox.Action, items: Inbox.ActionItem[]): void {
   const keys = new Set(items.map(keyOf));
-  for (const [key, view] of cache.entries('view', '')) {
+  for (const [key, view] of cache.entries<Inbox.ViewResult>('view', '')) {
     const folder = JSON.parse(key)[0];
     let changed = false;
-    const patch = (threads) =>
+    const patch = (threads: Thread[]) =>
       threads.filter((t) => {
         if (!t.messages.some((m) => keys.has(keyOf(m)))) return true;
         changed = true;
-        if (LEAVES[action]) return !LEAVES[action].includes(folder);
+        if (LEAVES[action]) return !LEAVES[action]!.includes(folder);
         for (const m of t.messages) {
           if (!keys.has(keyOf(m))) continue;
           if (action === 'read') m.unread = false;
@@ -496,9 +526,9 @@ function patchViews(action, items) {
 
 // quick: rows only (no other folders, no previews yet), for a first paint.
 async function listMessagesNow(
-  { folder = 'inbox', account = 'all', page = 1, q = '', threading = true, inboxType = 'default', sectionPage = 1, sectionSize = 25 } = {},
+  { folder = 'inbox', account = 'all', page = 1, q = '', threading = true, inboxType = 'default', sectionPage = 1, sectionSize = 25 }: Inbox.ViewParams = {},
   { quick = false } = {}
-) {
+): Promise<Inbox.ViewResult> {
   const size = sectionSizeOf(sectionSize);
   const targets = account === 'all' ? accounts() : [accountById(account)];
   const folderKey = q ? 'search' : folder;
@@ -519,20 +549,21 @@ async function listMessagesNow(
 
   const { complete, threads: all, errors } = await main;
   markImportance(all);
-  const sections = [];
+  const sections: Inbox.Section[] = [];
   let rest = all;
   if (sectioned) {
     const found = section ? await section : { complete: true, threads: all.filter((t) => t.important) };
+    const sectionId = inboxType as Inbox.Section['id'];
     if (section) markImportance(found.threads);
     // Everything else leaves out the whole section, not just the page shown
     // (including section mail older than what the section looked at; the
     // section ids are the conversation fields: t.unread, t.starred, t.important).
     const inSection = new Set(found.threads.flatMap((t) => t.messages.map(keyOf)));
-    rest = all.filter((t) => !t[inboxType] && !t.messages.some((m) => inSection.has(keyOf(m))));
+    rest = all.filter((t) => !t[sectionId] && !t.messages.some((m) => inSection.has(keyOf(m))));
     if (page === 1) {
       const n = found.threads.length;
       sections.push({
-        id: inboxType,
+        id: sectionId,
         title: SECTION_TITLES[inboxType],
         threads: found.threads.slice((sp - 1) * size, sp * size),
         page: sp,
@@ -561,7 +592,7 @@ async function listMessagesNow(
 
 // Every conversation of a view (looking at its newest 1000 messages), for
 // Gmail's "Select all N conversations". No previews: the window only needs to act on them.
-async function listEverything({ folder = 'inbox', account = 'all', q = '', threading = true } = {}) {
+export async function listEverything({ folder = 'inbox', account = 'all', q = '', threading = true }: Inbox.IpcArg<'listEverything'> = {}): Promise<Inbox.EverythingResult> {
   const targets = account === 'all' ? accounts() : [accountById(account)];
   const { complete, threads, errors } = await collect(
     targets,
@@ -576,7 +607,7 @@ async function listEverything({ folder = 'inbox', account = 'all', q = '', threa
 
 // Downloads messages ahead of time on the background connection (one command
 // per folder) and keeps them on disk, so opening them is instant.
-async function prefetch({ items }) {
+export async function prefetch({ items }: { items: Inbox.MessageRef[] }): Promise<boolean> {
   return inBackground(async () => {
     for (const group of groupBy(items, (i) => `${i.accountId}\n${i.folder}`).values()) {
       const a = accounts().find((x) => x.id === group[0].accountId);
@@ -587,26 +618,26 @@ async function prefetch({ items }) {
 }
 
 // The whole conversation a message belongs to, with previews for every message.
-async function getThread(params) {
+export async function getThread(params: Inbox.IpcArg<'getThread'>): Promise<Thread> {
   return params.background ? inBackground(() => getThreadNow(params)) : getThreadNow(params);
 }
 
-async function getThreadNow({ account, folder, uid }) {
+async function getThreadNow({ account, folder, uid }: Inbox.IpcArg<'getThread'>): Promise<Thread> {
   const a = accountById(account);
   const { target, candidates } = await backend(a).threadCandidates(a, folder, Number(uid));
   const key = keyOf(target);
-  const thread = buildThreads([target], candidates).find((t) => t.messages.some((m) => keyOf(m) === key));
+  const thread = buildThreads([target], candidates).find((t) => t.messages.some((m) => keyOf(m) === key))!;
   await fillThreadSnippets([thread], true);
   markImportance([thread]);
   return markThread(thread);
 }
 
-function partUrl(msg, idx) {
+function partUrl(msg: Inbox.MessageRef, idx: number): string {
   const p = new URLSearchParams({ a: msg.accountId, f: msg.folder, u: String(msg.uid), i: String(idx) });
   return `mailpart://att/?${p}`;
 }
 
-async function getMessage({ account, folder, uid, markSeen = true }) {
+export async function getMessage({ account, folder, uid, markSeen = true }: Inbox.IpcArg<'getMessage'>): Promise<Inbox.FullMessage> {
   const a = accountById(account);
   const msg = await backend(a).get(a, folder, Number(uid), { markSeen });
   let html = msg.html || '';
@@ -623,7 +654,7 @@ async function getMessage({ account, folder, uid, markSeen = true }) {
   return msg;
 }
 
-async function getAttachment({ account, folder, uid, idx }) {
+export async function getAttachment({ account, folder, uid, idx }: { account: string; folder: string; uid: number | string; idx: number | string }): Promise<AttachmentContent> {
   const a = accountById(account);
   const att = await backend(a).attachment(a, folder, Number(uid), Number(idx));
   if (!att) throw new Error('Attachment not found.');
@@ -631,11 +662,11 @@ async function getAttachment({ account, folder, uid, idx }) {
 }
 
 // Unread counts. { cached: true } answers instantly from the last known counts.
-async function counts(params = {}) {
-  if (params.cached) return cache.get('counts', 'all') || {};
+export async function counts(params: Inbox.IpcArg<'counts'> = {}): Promise<Inbox.Counts> {
+  if (params?.cached) return cache.get<Inbox.Counts>('counts', 'all') || {};
   const list = accounts();
   const results = await inBackground(() => Promise.allSettled(list.map((a) => backend(a).counts(a))));
-  const out = {};
+  const out: Inbox.Counts = {};
   results.forEach((r, i) => {
     out[list[i].id] = r.status === 'fulfilled' ? r.value : { error: backend(list[i]).friendlyError(r.reason, list[i]) };
   });
@@ -645,7 +676,8 @@ async function counts(params = {}) {
 
 // ---------- actions ----------
 
-const ACTIONS = {
+type Run = (b: Backend<AnyAccount>, a: AnyAccount, f: string, uids: number[]) => Promise<unknown>;
+const ACTIONS: Record<Inbox.Action, Run> = {
   read: (b, a, f, uids) => b.setFlags(a, f, uids, { seen: true }),
   unread: (b, a, f, uids) => b.setFlags(a, f, uids, { seen: false }),
   star: (b, a, f, uids) => b.setFlags(a, f, uids, { flagged: true }),
@@ -658,7 +690,7 @@ const ACTIONS = {
   unimportant: (b, a, f, uids) => b.setImportant(a, f, uids, false),
 };
 
-async function act({ action, items }) {
+export async function act({ action, items }: Inbox.IpcArg<'act'>): Promise<boolean> {
   const run = ACTIONS[action];
   if (!run) throw new Error(`Unknown action: ${action}`);
   // Your importance choice is remembered here (and also set on Gmail's label).
@@ -680,19 +712,19 @@ async function act({ action, items }) {
     })
   );
   const failed = results.filter((r) => r.status === 'rejected');
-  if (failed.length) throw new Error(failed[0].reason?.message || 'Action failed');
+  if (failed.length) throw new Error((failed[0] as PromiseRejectedResult).reason?.message || 'Action failed');
   patchViews(action, items);
   return true;
 }
 
 // ---------- sending ----------
 
-async function send(mail) {
+export async function send(mail: Inbox.OutgoingMail): Promise<Inbox.SendResult> {
   const a = accountById(mail.account);
   if (!String(mail.to || '').trim() && !String(mail.cc || '').trim() && !String(mail.bcc || '').trim()) {
     throw new Error('Please specify at least one recipient.');
   }
-  const attachments = (mail.attachments || []).map((f) => ({
+  const attachments: AttachmentContent[] = (mail.attachments || []).map((f) => ({
     filename: f.filename,
     contentType: f.contentType || 'application/octet-stream',
     content: Buffer.from(f.data),
@@ -733,23 +765,23 @@ async function send(mail) {
 
 // ---------- accounts ----------
 
-function normalizeServer(server, fallback) {
+function normalizeServer(server: Partial<Inbox.ServerConfig> | undefined, fallback: Inbox.ServerConfig): Inbox.ServerConfig {
   if (!server?.host) return { ...fallback };
   return { host: String(server.host).trim(), port: Number(server.port) || fallback.port, secure: !!server.secure };
 }
 
-function buildAccount(form) {
+function buildAccount(form: Partial<Inbox.AccountForm>) {
   const email = String(form.email || '').trim();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) throw new Error('Enter a valid email address.');
-  const provider = PROVIDERS[form.provider] ? form.provider : guessProvider(email);
+  const provider = PROVIDERS[form.provider as Inbox.ProviderId] ? (form.provider as Inbox.ProviderId) : guessProvider(email);
   const preset = PROVIDERS[provider];
-  const account = {
+  const account: Omit<Account, 'id' | 'pass'> & { pass?: string } = {
     provider,
     email,
     user: String(form.user || '').trim() || email,
     label: String(form.label || '').trim() || email.split('@')[0],
     senderName: String(form.senderName || '').trim(),
-    color: /^#[0-9a-f]{6}$/i.test(form.color) ? form.color : '#1a73e8',
+    color: /^#[0-9a-f]{6}$/i.test(form.color as string) ? (form.color as string) : '#1a73e8',
     imap: normalizeServer(form.imap, preset.imap),
     smtp: normalizeServer(form.smtp, preset.smtp),
   };
@@ -757,28 +789,28 @@ function buildAccount(form) {
   return account;
 }
 
-function cleanPassword(pass, provider) {
+function cleanPassword(pass: string | undefined, provider: string): string {
   const p = String(pass || '');
   // Google shows app passwords in groups of four separated by spaces.
   return provider === 'gmail' ? p.replace(/\s+/g, '') : p;
 }
 
-async function addAccount(form) {
+export async function addAccount(form: Inbox.AccountForm) {
   const account = buildAccount(form);
   account.pass = cleanPassword(form.pass, account.provider);
   if (!account.pass) throw new Error('Enter the app password for this account.');
   if (store.getAccounts().some((a) => a.email.toLowerCase() === account.email.toLowerCase())) {
     throw new Error('That account is already connected.');
   }
-  await imap.test(account);
-  const saved = store.addAccount(account);
+  await imap.test(account as Account);
+  const saved = store.addAccount(account as Omit<Account, 'id'>);
   cache.clearNs('view'); // stored views don't include the new account yet
   inboxSeen = null; // its existing mail isn't "new"
-  imap.watch(store.getAccounts().find((a) => a.id === saved.id), onMailPushed);
+  imap.watch(store.getAccounts().find((a) => a.id === saved.id)!, onMailPushed);
   return store.publicAccount(saved);
 }
 
-async function updateAccount(form) {
+export async function updateAccount(form: Inbox.AccountForm) {
   const existing = store.getAccounts().find((a) => a.id === form.id);
   if (!existing) throw new Error('That account no longer exists.');
   const next = buildAccount({ ...existing, ...form });
@@ -787,16 +819,16 @@ async function updateAccount(form) {
     pass !== existing.pass ||
     next.user !== existing.user ||
     JSON.stringify([next.imap, next.smtp]) !== JSON.stringify([existing.imap, existing.smtp]);
-  if (credentialsChanged) await imap.test({ ...next, pass });
+  if (credentialsChanged) await imap.test({ ...next, pass } as Account);
   imap.disconnect(existing.id);
-  const updated = store.updateAccount(existing.id, { ...next, pass: form.pass ? pass : undefined });
+  const updated = store.updateAccount(existing.id, { ...next, pass: form.pass ? pass : undefined })!;
   cache.clearNs('view'); // label and color are part of stored views
   inboxSeen = null;
   imap.watch(updated, onMailPushed);
   return store.publicAccount(updated);
 }
 
-function removeAccount({ id }) {
+export function removeAccount({ id }: { id: string }): boolean {
   imap.disconnect(id);
   store.removeAccount(id);
   cache.forgetAccount(id);
@@ -806,38 +838,12 @@ function removeAccount({ id }) {
 }
 
 // Neither of these touches the connection or the stored views, so they apply instantly.
-function reorderAccounts({ ids }) {
+export function reorderAccounts({ ids }: { ids: string[] }): boolean {
   store.reorderAccounts(ids);
   return true;
 }
 
-function setAccountNotify({ id, notify }) {
+export function setAccountNotify({ id, notify }: { id: string; notify: boolean }): boolean {
   if (!store.updateAccount(id, { notify: !!notify })) throw new Error('That account no longer exists.');
   return true;
 }
-
-module.exports = {
-  events,
-  initCache,
-  flushCache,
-  pollTracking,
-  trackingConfig,
-  setTracking,
-  getState,
-  warmUp,
-  startWatching,
-  listMessages,
-  listEverything,
-  getThread,
-  getMessage,
-  prefetch,
-  getAttachment,
-  counts,
-  act,
-  send,
-  addAccount,
-  updateAccount,
-  removeAccount,
-  reorderAccounts,
-  setAccountNotify,
-};

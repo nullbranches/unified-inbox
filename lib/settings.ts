@@ -1,8 +1,10 @@
 // App preferences, kept in settings.json next to the accounts.
-const fs = require('fs');
-const path = require('path');
+import fs from 'fs';
+import path from 'path';
 
-const DEFAULTS = {
+type Settings = Inbox.Settings;
+
+export const DEFAULTS: Settings = {
   theme: 'system', // 'system' | 'light' | 'dark'
   density: 'default', // 'default' | 'comfortable' | 'compact'
   inboxType: 'default', // 'default' | 'important' | 'unread' | 'starred'
@@ -18,7 +20,7 @@ const DEFAULTS = {
   trackOpens: true, // new mail has read tracking on (once a tracker is set up)
 };
 
-const ALLOWED = {
+const ALLOWED: { [K in keyof Settings]?: readonly Settings[K][] } = {
   theme: ['system', 'light', 'dark'],
   density: ['default', 'comfortable', 'compact'],
   inboxType: ['default', 'important', 'unread', 'starred'],
@@ -26,10 +28,10 @@ const ALLOWED = {
   readingPane: ['none', 'right', 'below'],
 };
 
-let file;
-let current = { ...DEFAULTS };
+let file: string;
+let current: Settings = { ...DEFAULTS };
 
-function init(dataDir) {
+export function init(dataDir: string): void {
   file = path.join(dataDir, 'settings.json');
   try {
     current = sanitize({ ...DEFAULTS, ...JSON.parse(fs.readFileSync(file, 'utf8')) });
@@ -38,24 +40,24 @@ function init(dataDir) {
   }
 }
 
-function sanitize(s) {
-  const out = {};
+// Every known setting, each one valid (anything else falls back to its default).
+function sanitize(s: Record<string, unknown>): Settings {
+  const out: Record<string, unknown> = {};
   for (const [key, def] of Object.entries(DEFAULTS)) {
     const v = s[key];
-    if (ALLOWED[key]) out[key] = ALLOWED[key].includes(v) ? v : def;
+    const allowed = ALLOWED[key as keyof Settings] as readonly unknown[] | undefined;
+    if (allowed) out[key] = allowed.includes(v) ? v : def;
     else out[key] = typeof v === typeof def ? v : def;
   }
-  return out;
+  return out as unknown as Settings;
 }
 
-function get() {
+export function get(): Settings {
   return { ...current };
 }
 
-function update(changes) {
+export function update(changes: Partial<Settings>): Settings {
   current = sanitize({ ...current, ...changes });
   fs.writeFileSync(file, JSON.stringify(current, null, 2));
   return get();
 }
-
-module.exports = { init, get, update, DEFAULTS };

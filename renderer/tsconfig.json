@@ -1,0 +1,13 @@
+{
+  // The window's script: a classic browser script (no imports/exports, so the
+  // output loads with a plain <script> tag), compiled to out/renderer/app.js.
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "preserve",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "types": [],
+    "rootDir": ".",
+    "outDir": "../out/renderer"
+  },
+  "include": ["app.ts", "globals.d.ts", "../types/**/*.d.ts"]
+}

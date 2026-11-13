@@ -1,6 +1,6 @@
-const path = require('path');
-const fs = require('fs');
-const {
+import path from 'path';
+import fs from 'fs';
+import {
   app,
   BrowserWindow,
   ipcMain,
@@ -15,10 +15,17 @@ const {
   Menu,
   clipboard,
   session,
-} = require('electron');
-const store = require('./lib/store');
-const settings = require('./lib/settings');
-const service = require('./lib/service');
+} from 'electron';
+import type { ContextMenuParams, MenuItemConstructorOptions, WebContents } from 'electron';
+import * as store from './lib/store';
+import * as settings from './lib/settings';
+import * as service from './lib/service';
+import * as imap from './lib/imap';
+import type { NewMailAlert } from './lib/service';
+import type { TrackRecord } from './lib/tracking';
+
+// Compiled to out/; the app's own files (renderer page, icons) are one level up.
+const ROOT = path.join(__dirname, '..');
 
 // mailpart://att/?a=<account>&f=<folder>&u=<uid>&i=<index> serves attachments
 // and inline images to the message view.
@@ -51,22 +58,22 @@ function registerForNotifications() {
   });
 }
 
-const ICON = path.join(__dirname, 'build', 'icon.png');
-const WIN_ICON = path.join(__dirname, 'build', 'icon.ico');
+const ICON = path.join(ROOT, 'build', 'icon.png');
+const WIN_ICON = path.join(ROOT, 'build', 'icon.ico');
 // Started by "Start with Windows": stay in the tray until opened.
 const startHidden = process.argv.includes('--hidden');
 
-let win;
-let tray;
+let win: BrowserWindow | null;
+let tray: Tray | undefined;
 let quitting = false;
 
-const THEME_COLORS = {
+const THEME_COLORS: Record<'light' | 'dark', { color: string; symbolColor: string }> = {
   light: { color: '#f6f8fc', symbolColor: '#444746' },
   dark: { color: '#1b1b1b', symbolColor: '#e3e3e3' },
 };
 const themeColors = () => THEME_COLORS[nativeTheme.shouldUseDarkColors ? 'dark' : 'light'];
 
-function openExternal(url) {
+function openExternal(url: string): void {
   if (/^mailto:/i.test(url)) {
     showWindow();
     win?.webContents.send('mailto', url);
@@ -75,17 +82,17 @@ function openExternal(url) {
   }
 }
 
-function showWindow() {
+function showWindow(): void {
   if (!win) return createWindow();
   if (win.isMinimized()) win.restore();
   win.show();
   win.focus();
 }
 
-function createWindow() {
+function createWindow(): void {
   const isMac = process.platform === 'darwin';
   const colors = themeColors();
-  win = new BrowserWindow({
+  const w = new BrowserWindow({
     width: 1440,
     height: 900,
     minWidth: 760,
@@ -107,49 +114,50 @@ function createWindow() {
       backgroundThrottling: false,
     },
   });
-  win.once('ready-to-show', () => {
-    if (!startHidden) win.show();
+  win = w;
+  w.once('ready-to-show', () => {
+    if (!startHidden) w.show();
   });
-  win.on('focus', () => {
-    win.flashFrame(false);
+  w.on('focus', () => {
+    w.flashFrame(false);
     service.pollTracking();
   });
   // Closing the window keeps the app running in the tray (if enabled).
-  win.on('close', (event) => {
+  w.on('close', (event) => {
     if (!quitting && settings.get().runInBackground && tray) {
       event.preventDefault();
-      win.hide();
+      w.hide();
     }
   });
-  win.on('closed', () => {
+  w.on('closed', () => {
     win = null;
   });
-  win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+  w.loadFile(path.join(ROOT, 'renderer', 'index.html'));
 
   // Links inside emails open in the default browser; mailto: opens our composer.
-  win.webContents.setWindowOpenHandler(({ url }) => {
+  w.webContents.setWindowOpenHandler(({ url }) => {
     openExternal(url);
     return { action: 'deny' };
   });
-  win.webContents.on('will-navigate', (event, url) => {
+  w.webContents.on('will-navigate', (event, url) => {
     if (!url.startsWith('file:')) {
       event.preventDefault();
       openExternal(url);
     }
   });
-  win.webContents.on('will-frame-navigate', (event) => {
+  w.webContents.on('will-frame-navigate', (event) => {
     if (!event.isMainFrame && !/^about:/.test(event.url)) {
       event.preventDefault();
       openExternal(event.url);
     }
   });
-  win.webContents.on('context-menu', (_event, params) => showContextMenu(win.webContents, params));
+  w.webContents.on('context-menu', (_event, params) => showContextMenu(w.webContents, params));
 }
 
 // Right-click menu for links, images, selected text and text fields (in the
 // app and inside opened emails). Electron shows none by default.
-function contextMenuItems(wc, params) {
-  const items = [];
+function contextMenuItems(wc: WebContents, params: ContextMenuParams): MenuItemConstructorOptions[] {
+  const items: MenuItemConstructorOptions[] = [];
   const sep = () => items.length && items[items.length - 1].type !== 'separator' && items.push({ type: 'separator' });
   const link = params.linkURL;
   if (link && !/^(javascript|file|about):/i.test(link)) {
@@ -191,15 +199,15 @@ function contextMenuItems(wc, params) {
   return items;
 }
 
-function showContextMenu(wc, params) {
+function showContextMenu(wc: WebContents, params: ContextMenuParams): void {
   const items = contextMenuItems(wc, params);
-  if (items.length) Menu.buildFromTemplate(items).popup({ window: win });
+  if (items.length) Menu.buildFromTemplate(items).popup({ window: win! }); // (a context menu comes from the window)
 }
 
 // The proxy Windows uses for a mail server (follows the system/PAC settings a
 // VPN app like Astrill sets), as a URL the mail libraries accept, or null.
-const PROXY_SCHEMES = { PROXY: 'http', SOCKS: 'socks4', SOCKS4: 'socks4', SOCKS5: 'socks5' };
-async function systemProxyFor(host, port) {
+const PROXY_SCHEMES: Record<string, string> = { PROXY: 'http', SOCKS: 'socks4', SOCKS4: 'socks4', SOCKS5: 'socks5' };
+async function systemProxyFor(host: string, port: number): Promise<string | null> {
   const rules = await session.defaultSession.resolveProxy(`https://${host}:${port}`);
   for (const rule of rules.split(';')) {
     const [type, address] = rule.trim().split(/\s+/);
@@ -210,10 +218,11 @@ async function systemProxyFor(host, port) {
   return null;
 }
 
-function createTray() {
-  tray = new Tray(nativeImage.createFromPath(ICON).resize({ width: 16, height: 16 }));
-  tray.setToolTip('Unified Inbox');
-  tray.setContextMenu(
+function createTray(): void {
+  const t = new Tray(nativeImage.createFromPath(ICON).resize({ width: 16, height: 16 }));
+  tray = t;
+  t.setToolTip('Unified Inbox');
+  t.setContextMenu(
     Menu.buildFromTemplate([
       { label: 'Open Unified Inbox', click: showWindow },
       { label: 'Check for new mail', click: () => win?.webContents.send('check-mail') },
@@ -227,10 +236,10 @@ function createTray() {
       },
     ])
   );
-  tray.on('click', showWindow);
+  t.on('click', showWindow);
 }
 
-function applySettings(s) {
+function applySettings(s: Inbox.Settings): void {
   nativeTheme.themeSource = s.theme;
   if (app.isPackaged) app.setLoginItemSettings({ openAtLogin: s.startWithWindows, args: ['--hidden'] });
 }
@@ -240,14 +249,15 @@ nativeTheme.on('updated', () => {
   win?.setBackgroundColor(themeColors().color);
 });
 
-function notify({ title, body, ref }) {
+function notify({ title, body, ref }: Inbox.NotifyRequest): boolean {
   if (!Notification.isSupported()) return false;
   const n = new Notification({ title, body, icon: nativeImage.createFromPath(ICON) });
   n.on('click', () => {
     showWindow();
     if (!ref) return;
-    const open = () => win.webContents.send('open-message', ref);
-    if (win.webContents.isLoading()) win.webContents.once('did-finish-load', open);
+    const w = win!;
+    const open = () => w.webContents.send('open-message', ref);
+    if (w.webContents.isLoading()) w.webContents.once('did-finish-load', open);
     else open();
   });
   n.show();
@@ -255,11 +265,11 @@ function notify({ title, body, ref }) {
   return true;
 }
 
-const clip = (text, n) => (text.length > n ? `${text.slice(0, n - 1)}…` : text);
+const clip = (text: string, n: number) => (text.length > n ? `${text.slice(0, n - 1)}…` : text);
 
 // Windows alerts for new mail, raised here (not by the window) so they also
 // show while the app is hidden in the tray.
-function alertNewMail(messages) {
+function alertNewMail(messages: NewMailAlert[]): void {
   if (!settings.get().notifications) return;
   if (messages.length <= 3) {
     for (const m of messages) {
@@ -278,7 +288,7 @@ function alertNewMail(messages) {
 }
 
 // "Maya Patel opened your email" when a tracked message is opened.
-function alertOpened(records) {
+function alertOpened(records: TrackRecord[]): void {
   if (!settings.get().notifications) return;
   for (const r of records.slice(0, 3)) {
     const first = String(r.to || '').split(',')[0].trim();
@@ -291,15 +301,16 @@ function alertOpened(records) {
   }
 }
 
-function safeFilename(name) {
+function safeFilename(name: string | undefined): string {
   return String(name || 'attachment').replace(/[\\/:*?"<>|]+/g, '_');
 }
 
-const handlers = {
+// Every IPC call (see Inbox.IpcCalls in types/inbox.d.ts).
+const handlers: { [K in Inbox.IpcName]: (arg: Inbox.IpcArg<K>) => Inbox.IpcResult<K> | Promise<Inbox.IpcResult<K>> } = {
   getState: () => ({ ...service.getState(), settings: settings.get(), tracking: service.trackingConfig() }),
   setTracking: (config) => service.setTracking(config),
   checkOpens: () => service.pollTracking(),
-  avatars: ({ addresses }) => (settings.get().senderPhotos ? require('./lib/avatars').lookupMany(addresses) : {}),
+  avatars: ({ addresses }) => (settings.get().senderPhotos ? (require('./lib/avatars') as typeof import('./lib/avatars')).lookupMany(addresses) : {}),
   listMessages: (params) => service.listMessages(params),
   listEverything: (params) => service.listEverything(params),
   getThread: (params) => service.getThread(params),
@@ -323,7 +334,7 @@ const handlers = {
 
   async saveAttachment(params) {
     const att = await service.getAttachment(params);
-    const { canceled, filePath } = await dialog.showSaveDialog(win, {
+    const { canceled, filePath } = await dialog.showSaveDialog(win!, {
       defaultPath: path.join(app.getPath('downloads'), safeFilename(att.filename)),
     });
     if (canceled || !filePath) return null;
@@ -352,12 +363,12 @@ const handlers = {
 // Every handler resolves to { ok, data } or { ok: false, error } so the
 // renderer gets clean error messages instead of Electron's IPC wrapper text.
 for (const [name, fn] of Object.entries(handlers)) {
-  ipcMain.handle(name, async (_event, arg) => {
+  ipcMain.handle(name, async (_event, arg): Promise<Inbox.IpcResponse<unknown>> => {
     try {
-      return { ok: true, data: await fn(arg) };
+      return { ok: true, data: await (fn as (arg: unknown) => unknown)(arg) };
     } catch (err) {
       console.error(`[${name}]`, err);
-      return { ok: false, error: err?.message || String(err) };
+      return { ok: false, error: (err as Error)?.message || String(err) };
     }
   });
 }
@@ -368,7 +379,7 @@ app.whenReady().then(() => {
   settings.init(dataDir);
   service.initCache(dataDir);
   applySettings(settings.get());
-  require('./lib/imap').setProxyResolver(systemProxyFor);
+  imap.setProxyResolver(systemProxyFor);
   // Log in to every account while the window loads, and listen for pushed mail.
   service.warmUp();
   service.startWatching();
@@ -388,7 +399,7 @@ app.whenReady().then(() => {
     try {
       const url = new URL(request.url);
       const q = url.searchParams;
-      const att = await service.getAttachment({ account: q.get('a'), folder: q.get('f'), uid: q.get('u'), idx: q.get('i') });
+      const att = await service.getAttachment({ account: q.get('a')!, folder: q.get('f')!, uid: q.get('u')!, idx: q.get('i')! });
       return new Response(att.content, {
         headers: { 'content-type': att.contentType || 'application/octet-stream' },
       });

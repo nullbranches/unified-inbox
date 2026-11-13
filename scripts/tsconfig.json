@@ -1,0 +1,15 @@
+{
+  // The build scripts stay plain JavaScript (they run before anything is
+  // compiled); this only type-checks them.
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "allowJs": true,
+    "checkJs": true,
+    "noEmit": true
+  },
+  "include": ["*.js"]
+}

@@ -1,29 +1,67 @@
 // In-memory demo backend with sample accounts and mail, used until a real
-// account is connected. Implements the same interface as ./imap.js.
+// account is connected. Implements the same interface as ./imap.ts.
+import type { AttachmentContent, Backend, DemoAccount, FlagChanges, ListResult, MoveTarget, OutgoingMessage } from './types';
 
-const ACCOUNTS = [
+// A sample message, as kept in memory.
+interface DemoAttachment {
+  filename: string;
+  contentType: string;
+  content: string | Buffer;
+}
+interface DemoMessage {
+  accountId: string;
+  folder: string;
+  uid: number;
+  from: Inbox.Address;
+  to: Inbox.Address[];
+  cc: Inbox.Address[];
+  subject: string;
+  text: string;
+  html: string | null;
+  date: string;
+  unread: boolean;
+  starred: boolean;
+  attachments: DemoAttachment[];
+  messageId: string;
+  inReplyTo: string | null;
+  references: string[];
+}
+interface AddOptions {
+  id?: string;
+  reply?: string;
+  to?: Inbox.Address[];
+  cc?: Inbox.Address[];
+  html?: string;
+  unread?: boolean;
+  starred?: boolean;
+  attachments?: DemoAttachment[];
+}
+// [name, address]
+type Person = [string, string];
+
+export const ACCOUNTS: DemoAccount[] = [
   { id: 'demo-personal', label: 'Personal', senderName: 'Alex Rivera', email: 'alex.rivera@gmail.com', color: '#1a73e8', provider: 'gmail', demo: true },
   { id: 'demo-work', label: 'Work', senderName: 'Alex Rivera', email: 'alex@northwind.dev', color: '#188038', provider: 'custom', demo: true },
   { id: 'demo-school', label: 'School', senderName: 'Alex Rivera', email: 'arivera@lakeside.edu', color: '#a142f4', provider: 'custom', demo: true },
 ];
 
-const FOLDERS = { inbox: 'INBOX', sent: 'Sent', drafts: 'Drafts', spam: 'Spam', trash: 'Trash', archive: 'Archive' };
+const FOLDERS: Record<string, string> = { inbox: 'INBOX', sent: 'Sent', drafts: 'Drafts', spam: 'Spam', trash: 'Trash', archive: 'Archive' };
 
 let nextUid = 1;
-const messages = [];
-const idsByLabel = new Map(); // demo label -> message, for building reply chains
+const messages: DemoMessage[] = [];
+const idsByLabel = new Map<string, DemoMessage>(); // demo label -> message, for building reply chains
 const now = Date.now();
 const MIN = 60 * 1000;
 const HOUR = 60 * MIN;
 const DAY = 24 * HOUR;
 
 // opts.id names a message so later ones can reply to it with opts.reply.
-function add(accountId, folder, ago, from, subject, text, opts = {}) {
-  const account = ACCOUNTS.find((a) => a.id === accountId);
+function add(accountId: string, folder: string, ago: number, from: Person, subject: string, text: string, opts: AddOptions = {}) {
+  const account = ACCOUNTS.find((a) => a.id === accountId)!;
   const [name, address] = from;
   const parent = opts.reply ? idsByLabel.get(opts.reply) : null;
   const uid = nextUid++;
-  const msg = {
+  const msg: DemoMessage = {
     accountId,
     folder,
     uid,
@@ -45,14 +83,14 @@ function add(accountId, folder, ago, from, subject, text, opts = {}) {
   if (opts.id) idsByLabel.set(opts.id, msg);
 }
 
-const me = (id) => {
-  const a = ACCOUNTS.find((x) => x.id === id);
+const me = (id: string): Person => {
+  const a = ACCOUNTS.find((x) => x.id === id)!;
   return [a.senderName, a.email];
 };
-const to = (name, address) => ({ to: [{ name, address }] });
+const to = (name: string, address: string) => ({ to: [{ name, address }] });
 
 // ---------- Personal ----------
-const maya = ['Maya Patel', 'maya.patel@gmail.com'];
+const maya: Person = ['Maya Patel', 'maya.patel@gmail.com'];
 add('demo-personal', 'INBOX', 9 * HOUR, maya, 'Dinner Saturday? 🍝',
   "Hey Alex!\n\nAre you free Saturday night? There's a new pasta place on 5th that just opened and the reviews are great. I was thinking 7:30 — Jordan and Sam might come too.\n\nLet me know!\nMaya", { id: 'dinner1' });
 add('demo-personal', 'Sent', 6 * HOUR, me('demo-personal'), 'Re: Dinner Saturday? 🍝',
@@ -93,8 +131,8 @@ add('demo-personal', 'INBOX', 20 * HOUR, ['Mom', 'linda.rivera@gmail.com'], 'Pho
 add('demo-personal', 'INBOX', 2 * DAY, ['Lumen Bank', 'statements@lumenbank.example'], 'Your October statement is ready',
   'Your monthly statement for the account ending in 4821 is now available. Sign in to the Lumen Bank app to view it.');
 
-const jordan = ['Jordan Lee', 'jordan.lee@gmail.com'];
-const sam = ['Sam Okoro', 'sam.okoro@gmail.com'];
+const jordan: Person = ['Jordan Lee', 'jordan.lee@gmail.com'];
+const sam: Person = ['Sam Okoro', 'sam.okoro@gmail.com'];
 const campers = { to: [{ name: jordan[0], address: jordan[1] }, { name: sam[0], address: sam[1] }] };
 add('demo-personal', 'Sent', 6 * DAY, me('demo-personal'), 'Camping trip gear list',
   "Hey both — who's bringing what for the lake trip? I have the tent but not much else.", { ...campers, id: 'camp1' });
@@ -121,8 +159,8 @@ add('demo-personal', 'INBOX', 16 * DAY, ['Pixelcraft Store', 'orders@pixelcraft.
   'Good news! Order #PC-20931 (mechanical keyboard, wrist rest) is on its way. Estimated delivery: 3–5 business days.');
 
 // ---------- Work ----------
-const priya = ['Priya Shah', 'priya@northwind.dev'];
-const daniel = ['Daniel Kim', 'daniel@northwind.dev'];
+const priya: Person = ['Priya Shah', 'priya@northwind.dev'];
+const daniel: Person = ['Daniel Kim', 'daniel@northwind.dev'];
 add('demo-work', 'INBOX', 2 * HOUR, priya, 'Q4 roadmap review — notes attached',
   "Hi team,\n\nAttached are the milestones we discussed. Please add comments before Thursday's review, especially on the API rate-limiting and the mobile onboarding items.\n\nThanks,\nPriya", {
     id: 'q4a',
@@ -142,7 +180,7 @@ add('demo-work', 'INBOX', 26 * HOUR, ['Northwind People Team', 'people@northwind
 add('demo-work', 'INBOX', 30 * HOUR, ['PagerAlert', 'alerts@pageralert.example'], '[Resolved] High latency on checkout-service',
   'Incident #1193 resolved after 18 minutes. p99 latency back under 300ms. Root cause: connection pool exhaustion after deploy 2026.10.18-3.');
 
-const sofia = ['Sofia Martinez', 'sofia@northwind.dev'];
+const sofia: Person = ['Sofia Martinez', 'sofia@northwind.dev'];
 add('demo-work', 'Sent', 4 * DAY, me('demo-work'), 'Customer interview notes',
   'Notes from this week are in the doc. Top themes: export, SSO, mobile.', { ...to(...sofia), id: 'int1' });
 add('demo-work', 'INBOX', 3 * DAY, sofia, 'Re: Customer interview notes',
@@ -160,7 +198,7 @@ add('demo-work', 'INBOX', 6 * DAY, ['Team Northwind', 'team@northwind.dev'], '�
   'Tacos, ramen, or the salad place? Vote in the thread by Wednesday!');
 
 // ---------- School ----------
-const okafor = ['Prof. Helen Okafor', 'hokafor@lakeside.edu'];
+const okafor: Person = ['Prof. Helen Okafor', 'hokafor@lakeside.edu'];
 add('demo-school', 'INBOX', 90 * MIN, okafor, 'CS 340: Assignment 3 feedback',
   'Hi Alex,\n\nNice work on the scheduler implementation. Your analysis of the round-robin quantum was especially clear. See comments in the grading portal — mostly minor style notes.\n\nGrade: 94/100\n\nProf. Okafor', { unread: true });
 add('demo-school', 'Sent', 3 * DAY, me('demo-school'), 'Question about assignment 3',
@@ -170,8 +208,8 @@ add('demo-school', 'INBOX', 2 * DAY + 20 * HOUR, okafor, 'Re: Question about ass
 add('demo-school', 'INBOX', 22 * HOUR, ['Lakeside Library', 'library@lakeside.edu'], 'Your hold is ready for pickup',
   '"Operating Systems: Three Easy Pieces" is ready at the main desk. It will be held for 7 days.', { unread: true });
 
-const lena = ['Lena Fischer', 'lfischer@lakeside.edu'];
-const raj = ['Raj Mehta', 'rmehta@lakeside.edu'];
+const lena: Person = ['Lena Fischer', 'lfischer@lakeside.edu'];
+const raj: Person = ['Raj Mehta', 'rmehta@lakeside.edu'];
 add('demo-school', 'INBOX', 3 * DAY, lena, 'Midterm study session — room 204?',
   "Who's in for a study session Wednesday evening? I can try to book room 204.", { id: 'study1' });
 add('demo-school', 'Sent', 2 * DAY + 12 * HOUR, me('demo-school'), 'Re: Midterm study session — room 204?',
@@ -198,12 +236,12 @@ add('demo-personal', 'Trash', 6 * DAY, ['Daily Deals', 'deals@dailydeals.example
 
 // ---------- interface ----------
 
-const find = (accountId, folder, uid) =>
+const find = (accountId: string, folder: string, uid: number | string) =>
   messages.find((m) => m.accountId === accountId && m.folder === folder && m.uid === Number(uid));
 
-const ROLES = Object.fromEntries(Object.entries(FOLDERS).map(([role, folder]) => [folder, role]));
+const ROLES: Record<string, string> = Object.fromEntries(Object.entries(FOLDERS).map(([role, folder]) => [folder, role]));
 
-function summary(m) {
+function summary(m: DemoMessage): Inbox.MessageSummary {
   return {
     accountId: m.accountId,
     folder: m.folder,
@@ -232,63 +270,63 @@ function summary(m) {
   };
 }
 
-function newest(list, count) {
+function newest(list: DemoMessage[], count: number): ListResult {
   const sorted = list.sort((a, b) => b.date.localeCompare(a.date));
   return { total: sorted.length, messages: sorted.slice(0, count).map(summary) };
 }
 
-const visible = (m) => m.folder !== 'Trash' && m.folder !== 'Spam';
+const visible = (m: DemoMessage) => m.folder !== 'Trash' && m.folder !== 'Spam';
 
-async function list(account, folderKey, count) {
+async function list(account: DemoAccount, folderKey: string, count: number): Promise<ListResult> {
   const mine = messages.filter((m) => m.accountId === account.id);
   if (folderKey === 'starred') return newest(mine.filter((m) => m.starred && visible(m)), count);
   if (folderKey === 'all') return newest(mine.filter(visible), count);
   return newest(mine.filter((m) => m.folder === FOLDERS[folderKey]), count);
 }
 
-async function listFiltered(account, filter, count) {
-  const want = (m) => (filter === 'unread' ? m.unread : m.starred);
+async function listFiltered(account: DemoAccount, filter: string, count: number): Promise<ListResult> {
+  const want = (m: DemoMessage) => (filter === 'unread' ? m.unread : m.starred);
   return newest(messages.filter((m) => m.accountId === account.id && m.folder === 'INBOX' && want(m)), count);
 }
 
 // Searches every folder, Trash and Spam included.
-async function search(account, query, count) {
+async function search(account: DemoAccount, query: string, count: number): Promise<ListResult> {
   const q = query.toLowerCase();
-  const hit = (m) =>
+  const hit = (m: DemoMessage) =>
     [m.subject, m.text, m.from.name, m.from.address, ...m.to.map((t) => t.address)].join(' ').toLowerCase().includes(q);
   return newest(messages.filter((m) => m.accountId === account.id && hit(m)), count);
 }
 
 // Everything else in the account's Inbox, Sent and Archive could be part of a conversation.
-async function related(account, folderKey, items) {
+async function related(account: DemoAccount, folderKey: string | null, items: Inbox.MessageSummary[]): Promise<Inbox.MessageSummary[]> {
   const own = new Set(items.map((m) => `${m.folder}|${m.uid}`));
   return messages
     .filter((m) => m.accountId === account.id && ['INBOX', 'Sent', 'Archive'].includes(m.folder) && !own.has(`${m.folder}|${m.uid}`))
     .map(summary);
 }
 
-async function threadCandidates(account, folder, uid) {
+async function threadCandidates(account: DemoAccount, folder: string, uid: number) {
   const m = find(account.id, folder, uid);
   if (!m) throw Object.assign(new Error('Message not found'), { status: 404 });
   return { target: summary(m), candidates: await related(account, null, [summary(m)]) };
 }
 
-async function fillSnippets() {}
+async function fillSnippets(): Promise<void> {}
 
-function escapeHtml(s) {
-  return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' } as Record<string, string>)[c]);
 }
 
-function textToHtml(text) {
+function textToHtml(text: string): string {
   return escapeHtml(text)
     .split(/\n{2,}/)
     .map((p) => `<p>${p.replace(/\n/g, '<br>')}</p>`)
     .join('');
 }
 
-async function prefetch() {} // demo mail is already in memory
+async function prefetch(): Promise<void> {} // demo mail is already in memory
 
-async function get(account, folder, uid, { markSeen = true } = {}) {
+async function get(account: DemoAccount, folder: string, uid: number, { markSeen = true } = {}): Promise<Inbox.FullMessage> {
   const m = find(account.id, folder, uid);
   if (!m) throw Object.assign(new Error('Message not found'), { status: 404 });
   if (markSeen) m.unread = false;
@@ -318,16 +356,16 @@ async function get(account, folder, uid, { markSeen = true } = {}) {
   };
 }
 
-async function attachment(account, folder, uid, idx) {
+async function attachment(account: DemoAccount, folder: string, uid: number, idx: number): Promise<AttachmentContent | undefined> {
   const a = find(account.id, folder, uid)?.attachments[idx];
   return a && { ...a, content: Buffer.from(a.content) };
 }
 
-async function forwardAttachments(account, folder, uid) {
+async function forwardAttachments(account: DemoAccount, folder: string, uid: number): Promise<AttachmentContent[]> {
   return (find(account.id, folder, uid)?.attachments || []).map((a) => ({ ...a, content: Buffer.from(a.content) }));
 }
 
-async function setFlags(account, folder, uids, { seen, flagged }) {
+async function setFlags(account: DemoAccount, folder: string, uids: number[], { seen, flagged }: FlagChanges): Promise<void> {
   for (const uid of uids) {
     const m = find(account.id, folder, uid);
     if (!m) continue;
@@ -336,9 +374,9 @@ async function setFlags(account, folder, uids, { seen, flagged }) {
   }
 }
 
-async function setImportant() {} // remembered by the service
+async function setImportant(): Promise<void> {} // remembered by the service
 
-async function move(account, folder, uids, target) {
+async function move(account: DemoAccount, folder: string, uids: number[], target: MoveTarget): Promise<void> {
   const dest = FOLDERS[target];
   if (!dest) throw new Error(`No ${target} folder`);
   for (const uid of uids) {
@@ -348,7 +386,7 @@ async function move(account, folder, uids, target) {
   }
 }
 
-async function remove(account, folder, uids) {
+async function remove(account: DemoAccount, folder: string, uids: number[]): Promise<void> {
   if (folder !== 'Trash' && folder !== 'Spam') return move(account, folder, uids, 'trash');
   for (const uid of uids) {
     const idx = messages.findIndex((m) => m.accountId === account.id && m.folder === folder && m.uid === Number(uid));
@@ -356,7 +394,7 @@ async function remove(account, folder, uids) {
   }
 }
 
-async function counts(account) {
+async function counts(account: DemoAccount): Promise<Inbox.AccountCounts> {
   const mine = messages.filter((m) => m.accountId === account.id);
   return {
     inbox: mine.filter((m) => m.folder === 'INBOX' && m.unread).length,
@@ -365,7 +403,7 @@ async function counts(account) {
   };
 }
 
-function parseAddresses(str) {
+function parseAddresses(str: string | undefined): Inbox.Address[] {
   return String(str || '')
     .split(/[,;]/)
     .map((s) => s.trim())
@@ -377,9 +415,9 @@ function parseAddresses(str) {
 }
 
 // "Sends" by filing the message in Sent, and delivers it to any demo account it was addressed to.
-async function send(account, mail) {
+async function send(account: DemoAccount, mail: OutgoingMessage): Promise<string> {
   const recipients = parseAddresses(mail.to);
-  const references = [].concat(mail.references || []).map((r) => String(r).toLowerCase());
+  const references = ([] as string[]).concat(mail.references || []).map((r) => String(r).toLowerCase());
   const base = {
     from: { name: account.senderName, address: account.email },
     to: recipients,
@@ -389,7 +427,7 @@ async function send(account, mail) {
     html: mail.html || null,
     date: new Date().toISOString(),
     starred: false,
-    attachments: mail.attachments || [],
+    attachments: (mail.attachments || []) as DemoAttachment[], // (from the window: always named)
     messageId: `<demo-${nextUid}@unified-inbox.local>`,
     inReplyTo: mail.inReplyTo ? String(mail.inReplyTo).toLowerCase() : null,
     references,
@@ -402,12 +440,12 @@ async function send(account, mail) {
   return base.messageId;
 }
 
-async function test() {}
-function disconnect() {}
-async function warmUp() {}
+async function test(): Promise<void> {}
+function disconnect(): void {}
+async function warmUp(): Promise<void> {}
 
-module.exports = {
-  ACCOUNTS,
+// (lib/service.ts uses this module as a Backend)
+export {
   warmUp,
   list,
   listFiltered,
@@ -427,5 +465,5 @@ module.exports = {
   send,
   test,
   disconnect,
-  friendlyError: (err) => err.message,
 };
+export const friendlyError = (err: unknown): string => (err as Error).message;
